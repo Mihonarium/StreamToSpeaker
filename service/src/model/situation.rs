@@ -440,6 +440,9 @@ pub enum Standing {
     /// The speaker was paused or stopped with its own controls while sound
     /// that no player's pause stops goes on: it is sent and not heard.
     PausedAtSpeaker { speaker: SpeakerId },
+    /// The app can't read this PC's sound while it is sent to `speaker`:
+    /// the speaker is silent until the app can read it again.
+    CantReadSound { speaker: SpeakerId },
 }
 
 /// The one state name a speaker's row shows, or a spinner.
@@ -601,7 +604,8 @@ pub struct Situation {
     /// The amber badge on the icon by the clock: sound isn't heard where
     /// it should be (the tries, or a start of sound that waits long enough
     /// for the note to say so), or the app moved the sound off a speaker
-    /// for a failure that still stands. Line 2 has its own amber, for
+    /// for a failure that still stands, or the app can't read the sound it
+    /// sends to a speaker. Line 2 has its own amber, for
     /// [`Doing::Trying`] and for a place that is `away`; the note's mark is
     /// [`Note::failure`].
     pub amber: bool,

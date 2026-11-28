@@ -777,6 +777,17 @@ fn status_lines_follow_precedence_and_link_to_the_right_page() {
         (
             Doing::Playing,
             vec![
+                Standing::PausedAtSpeaker { speaker: k.clone() },
+                Standing::CantReadSound { speaker: k.clone() },
+            ],
+            None,
+            Sign::Warn,
+            "Can’t read this PC’s sound",
+            None,
+        ),
+        (
+            Doing::Playing,
+            vec![
                 Standing::MusicAssistantNotStarted,
                 Standing::PausedAtSpeaker { speaker: k.clone() },
             ],
@@ -876,14 +887,19 @@ fn lasting_notes_and_repairs() {
         assert_note(view(&s).about, mark, title, body, button, false);
     }
     for (condition, mark, title, body, button) in [
-        (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose this app’s output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
+        (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose the Stream To Speaker output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
         (Standing::MusicAssistantNotStarted, Mark::Warn, "Music Assistant hasn’t started playing", "Start this PC’s sound in Music Assistant, or set Music Assistant to start it by itself.", ("How to start it", Command::Open(Open::MusicAssistantHowTo))),
         (Standing::MusicAssistantNotConnected, Mark::Warn, "Music Assistant isn’t connected", "This PC’s sound isn’t heard until it connects.", ("How to connect it", Command::Open(Open::MusicAssistantSettings))),
         (Standing::PausedAtSpeaker { speaker: kitchen() }, Mark::Warn, "Kitchen was paused", "It was paused with its own buttons or app, so this PC’s sound isn’t heard.", ("Switch to this PC", to_pc())),
+        (Standing::CantReadSound { speaker: kitchen() }, Mark::Warn, "Stream To Speaker can’t read this PC’s sound", "It keeps trying. Kitchen is silent meanwhile.", ("Switch to this PC", to_pc())),
         (Standing::CallOn { speaker: kitchen() }, Mark::Info, "A microphone is in use", "If this is a call, you will hear the other person late on Kitchen.", ("Switch to this PC", to_pc())),
     ] {
         let mut s = scene(); s.situation.standing.push(condition); assert_note(view(&s).about, mark, title, body, Some(button), false);
     }
+    // The app's own trouble is said before what the speaker does.
+    let mut s = scene();
+    s.situation.standing = vec![Standing::PausedAtSpeaker { speaker: kitchen() }, Standing::CantReadSound { speaker: kitchen() }];
+    assert_note(view(&s).about, Mark::Warn, "Stream To Speaker can’t read this PC’s sound", "It keeps trying. Kitchen is silent meanwhile.", Some(("Switch to this PC", to_pc())), false);
 }
 
 #[test]

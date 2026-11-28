@@ -243,26 +243,42 @@ impl ViewContent for CantHearView {
                                 }
                             }
                         });
-                    });
-                    if let Some(away) = &c.turned_away {
-                        // A device privacy turned away while nothing
-                        // fetches the sound. Whether it plays the
-                        // speaker's sound, the app can't tell: the page
-                        // says what happened and allows nothing itself.
-                        // The speaker's page lists the refused devices.
-                        let title = match &away.device {
-                            Some(device) => w!(lang, SetCheckRefused, device = device, address = &away.address),
-                            None => w!(lang, SetCheckRefusedUnnamed, address = &away.address),
-                        };
-                        check_line(ui, Found::Info, &title, Some(&w!(lang, SetCheckRefusedLine, speaker = &speaker)), |ui| {
-                            if let Some(id) = &id {
-                                if Button::standard(&w!(lang, SetOpenSpeakerSettings, speaker = &speaker))
-                                    .max_width(ui.max_rect().width()).show(ui).clicked() {
-                                    ask(Ask::Open(crate::model::command::Open::SpeakerSettings(id.clone())));
+                        // What the app knows that may be why, under the
+                        // step it belongs to.
+                        if let Some(network) = &c.public_network {
+                            // No device reached the app for the sound, on
+                            // a network Windows treats as public: what the
+                            // search check says of it, and why it matters
+                            // for this step.
+                            ui.add_space(8.0);
+                            check_line(ui, Found::Warning, &w!(lang, SetFindPublic, network = network), Some(&w!(lang, SetCheckPublicLine, speaker = &speaker)), |ui| {
+                                if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
+                                    ask(Ask::Open(crate::model::command::Open::NetworkSettings));
                                 }
-                            }
-                        });
-                    }
+                            });
+                        }
+                        if let Some(away) = &c.turned_away {
+                            // A device privacy turned away while nothing
+                            // fetches the sound. Whether it plays the
+                            // speaker's sound, the app can't tell: the
+                            // page says what happened and allows nothing
+                            // itself. The speaker's page lists the refused
+                            // devices.
+                            let title = match &away.device {
+                                Some(device) => w!(lang, SetCheckRefused, device = device, address = &away.address),
+                                None => w!(lang, SetCheckRefusedUnnamed, address = &away.address),
+                            };
+                            ui.add_space(8.0);
+                            check_line(ui, Found::Info, &title, Some(&w!(lang, SetCheckRefusedLine, speaker = &speaker)), |ui| {
+                                if let Some(id) = &id {
+                                    if Button::standard(&w!(lang, SetOpenSpeakerSettings, speaker = &speaker))
+                                        .max_width(ui.max_rect().width()).show(ui).clicked() {
+                                        ask(Ask::Open(crate::model::command::Open::SpeakerSettings(id.clone())));
+                                    }
+                                }
+                            });
+                        }
+                    });
                 }
                 Err(Taking::Paused) => {
                     // The panel's note, and its way out.

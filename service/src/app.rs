@@ -4213,14 +4213,45 @@ impl App {
             .ok();
     }
 
+    /// The AirPlay browse couldn't start. Said once per failure; the
+    /// network check retries quietly.
     fn note_discovery_failure(&self, e: &anyhow::Error) {
+        let mut error = self.discovery_error.lock().unwrap();
+        if error.is_some() {
+            debug!("AirPlay discovery: still failing to start: {:#}", e);
+            return;
+        }
         let msg = format!(
-            "AirPlay discovery couldn't start ({:#}). You can still add AirPlay speakers \
-             by address with the Add button.",
+            "AirPlay speaker discovery couldn't start ({:#}). It will keep trying. AirPlay \
+             speakers can still be added by address.",
             e
         );
         self.record_error(msg.clone());
-        *self.discovery_error.lock().unwrap() = Some(msg);
+        *error = Some(msg);
+    }
+
+    /// Why AirPlay speaker discovery isn't running, if it couldn't start.
+    pub(crate) fn airplay_discovery_error(&self) -> Option<String> {
+        self.discovery_error.lock().unwrap().clone()
+    }
+
+    /// Network check: try again to start an AirPlay browse that failed to
+    /// start (nothing else restarts it while the adapter scope holds).
+    fn retry_failed_airplay_discovery(&self, scope: &Resolved) {
+        if self.discovery_error.lock().unwrap().is_none() {
+            return;
+        }
+        if let Some(ctl) = self.mdns.lock().unwrap().as_ref() {
+            match ctl.apply(scope) {
+                Ok(()) => {
+                    *self.discovery_error.lock().unwrap() = None;
+                    if ctl.is_running() {
+                        info!("AirPlay discovery: started");
+                    }
+                }
+                Err(e) => self.note_discovery_failure(&e),
+            }
+        }
     }
 
     /// The saved adapter choice mapped onto `adapters`. A command-line pin
@@ -4255,7 +4286,7 @@ impl App {
     /// Re-check the adapters and apply any change of scope: restart mDNS
     /// (AirPlay and Sendspin) on the new interface set (or stop it while
     /// paused), forget what was found on the old network, and search again.
-    /// Otherwise retry a Sendspin browse that failed to start.
+    /// Otherwise retry an AirPlay or Sendspin browse that failed to start.
     fn refresh_discovery_scope(self: &Arc<Self>) {
         let _serial = self.scope_apply.lock().unwrap();
         let adapters = discovery_net::list_adapters();
@@ -4263,6 +4294,7 @@ impl App {
         *self.adapters_cache.lock().unwrap() = adapters;
         let old = std::mem::replace(&mut *self.discovery_scope.lock().unwrap(), new.clone());
         if old == new {
+            self.retry_failed_airplay_discovery(&new);
             self.retry_failed_sendspin_discovery();
             return;
         }
@@ -7708,6 +7740,44 @@ mod tests {
         assert!(!listed(), "listed while Sendspin is off");
         app.user_config.lock().unwrap().sendspin.enabled = true;
         assert!(listed());
+    }
+
+    #[test]
+    fn failed_airplay_discovery_is_retried_until_it_starts() {
+        let app = test_app();
+        // A browse that can't start until `fail` is cleared.
+        let fail = Arc::new(AtomicBool::new(true));
+        let f = fail.clone();
+        let ctl = MdnsController::stub(
+            "AirPlay",
+            move || {
+                if f.load(Ordering::SeqCst) {
+                    Err(anyhow!("no socket"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {},
+        );
+        let failed = ctl.apply(&app.current_discovery_scope()).unwrap_err();
+        app.note_discovery_failure(&failed);
+        *app.mdns.lock().unwrap() = Some(ctl);
+        let err = app.airplay_discovery_error().expect("failure noted");
+        assert!(err.contains("no socket"), "{}", err);
+        assert_eq!(app.discovery_net_status().error, Some(err.clone()));
+
+        // The network check retries while the scope stays the same, and
+        // says nothing more while the browse still can't start.
+        app.dismiss_error();
+        app.refresh_discovery_scope();
+        assert_eq!(app.airplay_discovery_error(), Some(err));
+        assert_eq!(app.current_error(), None);
+        assert!(!app.mdns.lock().unwrap().as_ref().unwrap().is_running());
+        fail.store(false, Ordering::SeqCst);
+        app.refresh_discovery_scope();
+        assert_eq!(app.airplay_discovery_error(), None);
+        assert_eq!(app.discovery_net_status().error, None);
+        assert!(app.mdns.lock().unwrap().as_ref().unwrap().is_running());
     }
 
     #[test]

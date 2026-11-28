@@ -946,6 +946,68 @@ fn calls_follow_the_setting_and_return_to_their_own_device() {
 }
 
 #[test]
+fn the_playback_check_says_when_windows_treats_the_speakers_network_as_public() {
+    use crate::discovery_net::NetAdapter;
+    use crate::model::situation::ConnKind;
+    use crate::model::{view::view, PortCore};
+    use crate::platform::NetConnection;
+    use crate::settings::{real::AppSettings, port::{SettingsPort, Taking}};
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    let settings = AppSettings::new(r.app.clone());
+    let port = Arc::new(PortCore::new(view(r.driver.scene(), None, false, 1)));
+    r.app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    // The adapter that counts is the one with the address the app gives
+    // the speaker for the sound (the test app's is 192.168.1.10).
+    let ethernet = || NetAdapter { key: "{AD-2}".into(), name: "Ethernet".into(), ipv4: vec!["10.0.0.5".parse().unwrap()] };
+    let wifi = || NetAdapter { key: "{AD-1}".into(), name: "Wi-Fi".into(), ipv4: vec!["192.168.1.10".parse().unwrap()] };
+    r.app.set_network_adapters(vec![ethernet(), wifi()]);
+    let conn = |id: &str, adapter: &str, name: Option<&str>, kind, private| NetConnection {
+        id: id.into(),
+        name: name.map(String::from),
+        kind,
+        adapter: Some(adapter.into()),
+        private,
+    };
+    let mut published = 1;
+    // What the step says of the network, with nobody fetching the sound.
+    let mut found = |r: &mut Rig, connections: Vec<NetConnection>| {
+        r.windows.connect_to(connections);
+        r.driver.look();
+        published += 1;
+        port.publish(view(r.driver.scene(), None, false, published));
+        let c = settings.playback_check();
+        assert_eq!(c.taking, Some(Err(Taking::NotAsking { two_ways: false })));
+        c.public_network
+    };
+    let wired = || conn("wire", "ad-2", Some("Office"), ConnKind::Wired, Some(false));
+    // Public, as Windows treats a newly joined network: named as the
+    // search check names it.
+    assert_eq!(found(&mut r, vec![wired(), conn("home", "ad-1", Some("HomeNet"), ConnKind::WiFi, Some(false))]).as_deref(), Some("HomeNet"));
+    assert_eq!(found(&mut r, vec![wired(), conn("home", "ad-1", None, ConnKind::WiFi, Some(false))]).as_deref(), Some("Wi-Fi"));
+    // Private, or Windows doesn't say: nothing. Another adapter's public
+    // network isn't the speaker's.
+    assert_eq!(found(&mut r, vec![wired(), conn("home", "ad-1", Some("HomeNet"), ConnKind::WiFi, Some(true))]), None);
+    assert_eq!(found(&mut r, vec![wired(), conn("home", "ad-1", Some("HomeNet"), ConnKind::WiFi, None)]), None);
+    assert_eq!(found(&mut r, vec![wired()]), None);
+    // A VPN's isn't a finding about the speaker's network.
+    assert_eq!(found(&mut r, vec![conn("vpn", "ad-1", Some("Corp"), ConnKind::Other, Some(false))]), None);
+    // An address none of the adapters has: no network to name.
+    r.app.set_network_adapters(vec![ethernet()]);
+    assert_eq!(found(&mut r, vec![wired()]), None);
+    r.app.set_network_adapters(vec![ethernet(), wifi()]);
+    // A device that asked and was turned away did reach this PC: the
+    // step says that, and nothing of the network.
+    assert_eq!(found(&mut r, vec![conn("home", "ad-1", Some("HomeNet"), ConnKind::WiFi, Some(false))]).as_deref(), Some("HomeNet"));
+    r.app.set_privacy_mode(true);
+    assert!(r.app.check_stream_client("192.0.2.77".parse().unwrap()).is_err());
+    let c = settings.playback_check();
+    assert!(c.turned_away.is_some());
+    assert_eq!(c.public_network, None);
+}
+
+#[test]
 fn the_playback_check_says_which_device_privacy_turned_away_while_nobody_fetches_the_sound() {
     use crate::model::{view::view, PortCore};
     use crate::settings::{real::AppSettings, port::{Act, SettingsPort, Taking, TurnedAway}};
@@ -1100,6 +1162,26 @@ fn covering_settings_restores_the_delay_keys() {
 #[test]
 fn closing_the_window_restores_the_delay_keys() {
     keys_after_hiding_settings(true);
+}
+
+#[test]
+fn the_panel_says_when_the_app_cant_read_this_pcs_sound() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    let lost = Standing::CantReadSound { speaker: id() };
+    let line = |r: &mut Rig| crate::model::panel::panel(&r.driver.scene()).place.state.text;
+    assert!(!r.driver.situation().standing.contains(&lost));
+    r.app.note_sound_input_lost("the sound device went away");
+    r.driver.look();
+    let sit = r.driver.situation();
+    assert!(sit.standing.contains(&lost) && sit.amber);
+    assert_eq!(line(&mut r), "Can’t read this PC’s sound");
+    r.app.note_sound_input_back();
+    r.driver.look();
+    let sit = r.driver.situation();
+    assert!(!sit.standing.contains(&lost) && !sit.amber);
+    assert_ne!(line(&mut r), "Can’t read this PC’s sound");
 }
 
 #[test]

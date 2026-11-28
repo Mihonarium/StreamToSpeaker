@@ -746,7 +746,7 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-not-connected"));
     assert!(h.has("Music Assistant isn’t connected.") && h.has("This PC’s sound isn’t heard until it connects."));
     assert!(!h.has("Connect") && !h.shows("Connected to") && !h.has("Not connected."));
-    assert!(h.shows("It stops at the first broken step."));
+    assert!(h.shows("It checks no further than the first broken step."));
     h.click("How to connect it");
     assert_eq!(h.asks(), vec![Asked::Open(Open::MusicAssistantSettings)]);
     // The app can't read the sound Windows sends it: said, with the way
@@ -816,7 +816,7 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     assert!(h.has("Kitchen was paused.") && h.shows("It was paused with its own buttons or app, so this PC’s sound isn’t heard."));
     assert!(!h.shows("is taking the sound") && !h.shows("Everything this PC can check looks right."));
-    assert!(h.shows("It stops at the first broken step.") && !h.shows("volume"));
+    assert!(h.shows("It checks no further than the first broken step.") && !h.shows("volume"));
     h.click("Switch to this PC");
     assert_eq!(h.asks(), vec![Asked::Command(Command::Switch { place: crate::model::state::Place::ThisPc, way: None })]);
     let port = scripted(|s| {
@@ -834,6 +834,35 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
 }
 
 #[test]
+fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
+    let not_asking = |network: Option<&str>| {
+        let network = network.map(String::from);
+        scripted(move |s| {
+            s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+            s.playback.public_network = network;
+            s.playback.volume = None;
+        })
+    };
+    let port = not_asking(Some("HomeNet"));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    // The broken step stays the speaker's, with its way out.
+    assert!(h.has("Kitchen accepted the connection but isn’t asking for the sound.") && h.has("Try Kitchen again"));
+    // Under it, what the search check says of the network, and why it
+    // matters here: the speaker has to reach this PC for the sound.
+    assert!(h.has("Windows treats “HomeNet” as a public network."));
+    assert!(h.shows("Kitchen fetches the sound from this PC, and on a public network Windows Firewall may stop it."));
+    assert!(h.shows("choose Private in its properties in Windows’ network settings, then try Kitchen again."));
+    h.click("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    assert_eq!(h.acts(), vec![]);
+    // On a private network, or one Windows says nothing of, the step
+    // has nothing to say about the network.
+    let port = not_asking(None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Try Kitchen again") && !h.shows("public network") && !h.has("Open network settings"));
+}
+
+#[test]
 fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
     let away = |device: Option<&str>| {
         let device = device.map(String::from);
@@ -847,11 +876,11 @@ fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     // The broken step stays the speaker's, with its ways out.
     assert!(h.has("Kitchen accepted the connection but isn’t asking for the sound.") && h.has("Try Kitchen again"));
-    assert!(h.shows("It stops at the first broken step.") && !h.shows("is taking the sound") && !h.shows("volume"));
+    assert!(h.shows("It checks no further than the first broken step.") && !h.shows("is taking the sound") && !h.shows("volume"));
     // The device is named with its address, and the page allows nothing:
     // its button opens the speaker's page, which lists the refused ones.
-    assert!(h.has("Kitchen Sub (192.168.1.51) asked for the sound and was refused."));
-    assert!(h.shows("Only Kitchen is allowed to listen. If that device is yours and plays together with Kitchen, you can allow it in Kitchen’s settings."));
+    assert!(h.has("Stream To Speaker refused Kitchen Sub (192.168.1.51), which asked for the sound."));
+    assert!(h.shows("It lets only the speaker you picked listen. If that device is yours and plays together with Kitchen, allow it in Kitchen’s settings."));
     assert!(!h.has("Allow") && !h.has("Allow it"));
     h.click("Open Kitchen’s settings");
     assert_eq!(h.asks(), vec![Asked::Open(Open::SpeakerSettings(sid("kitchen")))]);
@@ -859,14 +888,14 @@ fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
     // A device the search doesn't know goes by its address.
     let port = away(None);
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("A device at 192.168.1.51 asked for the sound and was refused."));
+    assert!(h.has("Stream To Speaker refused a device at 192.168.1.51, which asked for the sound."));
     // Without one, the step has nothing to say about privacy.
     let port = scripted(|s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
         s.playback.volume = None;
     });
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(!h.shows("was refused") && !h.shows("allowed to listen"));
+    assert!(!h.shows("refused") && !h.shows("listen"));
 }
 
 #[test]
@@ -880,7 +909,7 @@ fn cant_hear_says_why_the_sound_stayed_on_this_pc() {
     let port = scripted(|s| s.playback.speaker = None);
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), Arc::new(crate::model::view::view(scene, None, false, 1)));
     assert!(h.has("Your sound is on this PC.") && h.has("Windows didn’t switch to Kitchen."));
-    assert!(h.shows("Try again, or choose this app’s output in Windows’ sound settings.") && !h.shows("Pick a speaker in the panel"));
+    assert!(h.shows("Try again, or choose the Stream To Speaker output in Windows’ sound settings.") && !h.shows("Pick a speaker in the panel"));
     h.click("Try Kitchen again");
     assert_eq!(h.asks(), vec![Asked::Command(Command::Switch { place: crate::model::state::Place::Speaker(kitchen), way: None })]);
     h.click("Open Windows’ sound settings");
@@ -1129,10 +1158,12 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: Some(150), homepod_buffered: true, speakers: vec![] });
             s.playback.volume = Some(Err(Volume::Zero));
             s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
+            s.playback.public_network = Some("HomeNet".into());
             s.speakers.networks.as_mut().unwrap().looking = Looking::AdapterOff { adapter: "Wi-Fi".into() };
             s.discovery.lines = vec![
                 FindLine::Profile { network: "HomeNet".into(), private: false },
                 FindLine::AirPlaySearchFailed,
+                FindLine::SendspinSearchFailed,
                 FindLine::AdapterOff { adapter: "Wi-Fi".into() },
                 FindLine::Failed { adapter: "Wi-Fi".into(), why: "no answer".into() },
             ];

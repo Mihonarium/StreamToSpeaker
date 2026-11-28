@@ -203,6 +203,19 @@ impl AppSettings {
         })
     }
 
+    /// The network this PC reaches the connected speaker over, by the name
+    /// the search check gives it, where Windows treats it as public.
+    fn public_network_toward_speaker(&self) -> Option<String> {
+        let app = &self.app;
+        let IpAddr::V4(ours) = app.local_ip_toward(app.selected_speaker()?.ip).ok()? else {
+            return None;
+        };
+        let adapters = app.network_adapters();
+        let adapter = adapters.iter().find(|a| a.ipv4.contains(&ours))?;
+        let (network, private) = profile_of(&self.networks(), adapter)?;
+        (!private).then_some(network)
+    }
+
     /// Every speaker the app lists, hidden ones included, as rows.
     fn rows(&self) -> Vec<(SpeakerRow, bool)> {
         let app = &self.app;
@@ -673,6 +686,7 @@ impl SettingsPort for AppSettings {
             connected: None,
             taking: None,
             turned_away: None,
+            public_network: None,
             volume: None,
             untested: false,
             apple_tv: false,
@@ -749,6 +763,12 @@ impl SettingsPort for AppSettings {
                         let address = refused.address.to_string();
                         TurnedAway { device: (refused.name != address).then_some(refused.name), address }
                     });
+                    // With no device turned away either, Windows Firewall
+                    // may be what keeps the speaker out: it is stricter on
+                    // a network Windows treats as public.
+                    if c.turned_away.is_none() {
+                        c.public_network = self.public_network_toward_speaker();
+                    }
                     // The speaker can be reached by AirPlay as well.
                     Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
                 }
@@ -773,8 +793,11 @@ impl SettingsPort for AppSettings {
         let st = app.discovery_net_status();
         let found = app.speaker_view().speakers.iter().filter(|s| s.id != MA_OUTPUT_ID).count();
         let mut lines = find_lines(&st.scope, &app.network_adapters(), &self.networks(), found);
-        if st.error.is_some() {
+        if app.airplay_discovery_error().is_some() {
             lines.push(FindLine::AirPlaySearchFailed);
+        }
+        if app.sendspin_discovery_error().is_some() {
+            lines.push(FindLine::SendspinSearchFailed);
         }
         DiscoveryCheck { lines }
     }
@@ -1186,17 +1209,20 @@ fn network_name(networks: &[NetworkSeen], adapter: &NetAdapter) -> Option<String
     network.name.clone().filter(|name| !name.eq_ignore_ascii_case(&adapter.name))
 }
 
+/// What Windows treats an adapter's network as, where it says, with the
+/// name the pages give that network. A VPN's isn't a finding about the
+/// network the speakers are on.
+fn profile_of(networks: &[NetworkSeen], adapter: &NetAdapter) -> Option<(String, bool)> {
+    let network = network_on(networks, adapter).filter(|n| n.kind != ConnKind::Other)?;
+    Some((network.name.clone().unwrap_or_else(|| adapter.name.clone()), network.private?))
+}
+
 /// The lines of *Check step by step* about where the app looks: each
 /// network, a VPN beside them, and what Windows treats each network as.
 pub(super) fn find_lines(scope: &Resolved, adapters: &[NetAdapter], networks: &[NetworkSeen], found: usize) -> Vec<FindLine> {
     let mut lines = Vec::new();
     let place = |a: &NetAdapter, ip: Ipv4Addr| NetworkPlace { adapter: a.name.clone(), network: network_name(networks, a), address: subnet(&ip.to_string()) };
-    // What Windows treats an adapter's network as, where it says. A VPN's
-    // isn't a finding about the network the speakers are on.
-    let profile = |a: &NetAdapter| {
-        let network = network_on(networks, a).filter(|n| n.kind != ConnKind::Other)?;
-        Some(FindLine::Profile { network: network.name.clone().unwrap_or_else(|| a.name.clone()), private: network.private? })
-    };
+    let profile = |a: &NetAdapter| profile_of(networks, a).map(|(network, private)| FindLine::Profile { network, private });
     match scope {
         Resolved::Paused { name } => lines.push(FindLine::AdapterOff { adapter: name.clone() }),
         Resolved::Active { name, ip } => {

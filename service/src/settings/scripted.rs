@@ -487,6 +487,7 @@ pub fn example() -> State {
             connected: Some(Ok(())),
             taking: Some(Ok(Taking::Yes)),
             turned_away: None,
+            public_network: None,
             volume: Some(Ok(Volume::Level(32))),
             untested: false,
             apple_tv: false,
