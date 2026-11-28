@@ -924,7 +924,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     if became_synced && start_pending && conn.source_active.load(Ordering::SeqCst) && conn.is_selected() {
                         start_pending = false;
                         conn.start_stream()?;
-                        set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: true });
+                        stream_started(sh, conn_id, &server_name);
                     }
                 }
                 "server/command" => {
@@ -939,7 +939,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                                 if conn.source_active.load(Ordering::SeqCst) && conn.synced() {
                                     conn.start_stream()?;
                                     note(sh, format!("{} started playing this PC's audio", server_name));
-                                    set_state(sh, conn_id, SourceState::Connected { server: server_name.clone(), streaming: true });
+                                    stream_started(sh, conn_id, &server_name);
                                 } else if conn.source_active.load(Ordering::SeqCst) {
                                     // Start as soon as the clock has synced.
                                     start_pending = true;
@@ -1159,6 +1159,13 @@ fn set_state(sh: &Shared, conn_id: u64, st: SourceState) {
     if is_current {
         *sh.state.lock().unwrap() = st;
     }
+}
+
+/// A server started playing this PC's sound: the state says so, and the
+/// time is remembered for the Music Assistant page.
+fn stream_started(sh: &Shared, conn_id: u64, server_name: &str) {
+    sh.store.update(&mut |c: &mut SendspinConfig| c.note_played(unix_now()));
+    set_state(sh, conn_id, SourceState::Connected { server: server_name.to_string(), streaming: true });
 }
 
 /// Run one pairing attempt. Returns a follow-up `server/activate` to

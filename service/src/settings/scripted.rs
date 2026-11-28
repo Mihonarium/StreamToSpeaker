@@ -438,6 +438,7 @@ pub fn example() -> State {
             played: None,
             paused: false,
             token: Some("SP:0f3a9c2e7b5d41a8c6e0b9d2f1a47e3c".into()),
+            public_network: None,
         },
         privacy: PrivacyView {
             only_playing: true,
@@ -445,10 +446,10 @@ pub fn example() -> State {
                 Refused {
                     name: Some("Kitchen Sub".into()),
                     address: "192.168.1.51".into(),
-                    at: LocalTime::new(20, 40),
+                    at: Seen::Today(LocalTime::new(20, 40)),
                     group_of: Some(("kitchen".into(), "Kitchen".into())),
                 },
-                Refused { name: None, address: "192.168.1.77".into(), at: LocalTime::new(21, 12), group_of: None },
+                Refused { name: None, address: "192.168.1.77".into(), at: Seen::Today(LocalTime::new(21, 12)), group_of: None },
             ]),
             phone: Some(Phone { on: true, link: Some("http://192.168.1.23:5901/r/2f7a9c41d0b85e63a1c4f09b7d2e8a56/".into()), problem: None }),
             api: Some(Api { on: false, key: Some("2f7a9c41d0b85e63a1c4f09b7d2e8a56".into()) }),
@@ -488,6 +489,7 @@ pub fn example() -> State {
             taking: Some(Ok(Taking::Yes)),
             turned_away: None,
             public_network: None,
+            not_reached: false,
             volume: Some(Ok(Volume::Level(32))),
             untested: false,
             apple_tv: false,

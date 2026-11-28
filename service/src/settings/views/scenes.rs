@@ -68,6 +68,8 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-trying", 640.0, cant_hear_trying),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
         s("view-cant-hear-public-network", 860.0, cant_hear_public),
+        s("view-cant-hear-not-reached-public-network", 900.0, cant_hear_not_reached_public),
+        s("view-cant-hear-not-reached", 760.0, cant_hear_not_reached),
         s("view-cant-hear-windows-didnt-switch", 520.0, cant_hear_didnt_switch),
         s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
         s("view-cant-hear-app-elsewhere-playing", 900.0, cant_hear_app_while_playing),
@@ -82,6 +84,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-music-assistant-setting-up", 1120.0, ma_setting_up),
         s("view-music-assistant-done", 1100.0, ma_done),
         s("view-music-assistant-not-connected", 1100.0, ma_not_connected),
+        s("view-music-assistant-public-network", 1100.0, ma_public_network),
         s("view-about", 880.0, about),
         s("view-about-up-to-date", 760.0, about_latest),
         s("view-lab", 1300.0, lab),
@@ -512,6 +515,24 @@ fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
     });
 }
 
+/// An AirPlay speaker that hasn't reached this PC, on a network Windows
+/// treats as public.
+fn cant_hear_not_reached_public(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-not-reached-public-network", "kitchen-playing", |s| {
+        s.playback.taking = Some(Ok(Taking::CantTell));
+        s.playback.not_reached = true;
+        s.playback.public_network = Some("HomeNet".into());
+    });
+}
+
+/// A speaker that follows this PC's clock and hasn't reached this PC.
+fn cant_hear_not_reached(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-not-reached", "kitchen-playing", |s| {
+        s.playback.taking = Some(Ok(Taking::CantTell));
+        s.playback.not_reached = true;
+    });
+}
+
 fn cant_hear_public(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-public-network", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
@@ -610,6 +631,15 @@ fn ma_done(ui: &mut Ui, _: &mut Stage) {
         s.ma.code = None;
         s.ma.paired_with = vec!["Music Assistant (Home)".into()];
         s.ma.played = Some(None);
+    });
+}
+
+/// Not found yet, on a network Windows treats as public.
+fn ma_public_network(ui: &mut Ui, _: &mut Stage) {
+    ma(ui, "ma-public-network", |s| {
+        s.ma.found_by = None;
+        s.ma.code = None;
+        s.ma.public_network = Some("HomeNet".into());
     });
 }
 

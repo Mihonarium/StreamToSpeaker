@@ -65,15 +65,7 @@ impl PlaceDriver {
 
     fn publish(&mut self, out: &Outlet, previous: Option<Arc<View>>) -> Arc<View> {
         let (scene, ours) = self.scene_and_output();
-        let sit = &scene.situation;
-        let sending = sit.doing == Doing::Playing
-            && sit
-                .place_speaker()
-                .is_some_and(|id| self.core.connected_speaker() == Some(id))
-            && !sit
-                .standing
-                .iter()
-                .any(|s| matches!(s, Standing::MusicAssistantNotStarted | Standing::MusicAssistantNotConnected));
+        let sending = sends_to_place(&scene.situation, self.core.connected_speaker());
         let level = ours
             .as_ref()
             .filter(|_| sending)
@@ -98,6 +90,18 @@ impl PlaceDriver {
         (out.level)(level);
         current
     }
+}
+
+/// Whether this PC's sound reaches the speaker that is the place: what the
+/// level meter shows. It doesn't while Music Assistant is the place and its
+/// server isn't connected or hasn't started this PC's sound.
+pub(super) fn sends_to_place(sit: &crate::model::situation::Situation, connected: Option<&SpeakerId>) -> bool {
+    sit.doing == Doing::Playing
+        && sit.place_speaker().is_some_and(|id| connected == Some(id))
+        && !sit
+            .standing
+            .iter()
+            .any(|s| matches!(s, Standing::MusicAssistantNotStarted | Standing::MusicAssistantNotConnected))
 }
 
 /// Starts the place driver on its own thread and subscribes it to Windows.

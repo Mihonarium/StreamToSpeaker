@@ -19,6 +19,7 @@ pub enum WindowsPage {
     Sound,
     VolumeMixer,
     Network,
+    Security,
 }
 
 impl WindowsPage {
@@ -28,6 +29,7 @@ impl WindowsPage {
             WindowsPage::Sound => "ms-settings:sound",
             WindowsPage::VolumeMixer => "ms-settings:apps-volume",
             WindowsPage::Network => "ms-settings:network-status",
+            WindowsPage::Security => "ms-settings:windowsdefender",
         }
     }
 }
@@ -109,6 +111,10 @@ impl Contents for SettingsContents {
             }
             Open::NetworkSettings => {
                 (self.open_windows_page)(WindowsPage::Network);
+                None
+            }
+            Open::WindowsSecurity => {
+                (self.open_windows_page)(WindowsPage::Security);
                 None
             }
             _ => None,
@@ -308,11 +314,12 @@ mod tests {
         assert_eq!(s.take_acts(), vec![Act::Donate]);
         assert!(c.open(&Open::ReportProblem, &snap("restart-needed"), true).is_some());
         OPENED.lock().unwrap().clear();
-        for open in [Open::SoundSettings, Open::VolumeMixer, Open::NetworkSettings] {
+        let pages = vec![WindowsPage::Sound, WindowsPage::VolumeMixer, WindowsPage::Network, WindowsPage::Security];
+        for open in [Open::SoundSettings, Open::VolumeMixer, Open::NetworkSettings, Open::WindowsSecurity] {
             assert!(c.open(&open, &snap("kitchen-playing"), true).is_none());
         }
-        assert_eq!(*OPENED.lock().unwrap(), vec![WindowsPage::Sound, WindowsPage::VolumeMixer, WindowsPage::Network]);
-        assert!(WindowsPage::Sound.uri().starts_with("ms-settings:"));
+        assert_eq!(*OPENED.lock().unwrap(), pages);
+        assert!(pages.iter().all(|p| p.uri().starts_with("ms-settings:")));
     }
 
     #[test]

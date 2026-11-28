@@ -584,6 +584,25 @@ fn values_from_an_earlier_version_are_carried_over_not_lab_settings() {
 }
 
 #[test]
+fn music_assistant_having_played_is_remembered_across_starts() {
+    use super::real::earlier_day;
+    let (app, port, _desk) = real();
+    assert_eq!(port.music_assistant().played, None);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // It played three days ago, and the app has started since.
+    app.user_config.lock().unwrap().sendspin.source_played_unix = Some(now - 3 * 86_400);
+    assert!(matches!(port.music_assistant().played, Some(Some(_))), "{:?}", port.music_assistant().played);
+    // Today's is said without its date.
+    app.user_config.lock().unwrap().sendspin.source_played_unix = Some(now);
+    assert_eq!(port.music_assistant().played, Some(None));
+    // 2026-11-23 12:00 UTC, an hour east of it.
+    let noon = 1_795_435_200;
+    assert_eq!(earlier_day(noon - 3 * 3600, noon, 3600), None);
+    assert_eq!(earlier_day(noon - 20 * 3600, noon, 3600), Some(Date { day: 22, month: 11 }));
+    assert_eq!(earlier_day(noon - 50 * 86_400, noon, 3600), Some(Date { day: 4, month: 10 }));
+}
+
+#[test]
 fn a_moment_is_said_as_today_yesterday_or_a_date() {
     use super::real::seen_at;
     // 2026-11-23 12:00 UTC, an hour east of it.
@@ -693,6 +712,49 @@ fn the_search_check_names_each_network_and_what_windows_treats_it_as() {
         [FindLine::LookingOn { place: place("Wi-Fi", None, "192.168.1.x"), found: 0 }, FindLine::Profile { network: "Wi-Fi".into(), private: false }]
     );
     assert_eq!(find_lines(&Resolved::Paused { name: "Wi-Fi".into() }, &adapters, &networks, 0), [FindLine::AdapterOff { adapter: "Wi-Fi".into() }]);
+}
+
+#[test]
+fn the_search_check_names_the_search_that_couldnt_start() {
+    let (app, settings, _) = real();
+    let failed = || -> Vec<FindLine> {
+        let lines = settings.discovery_check().lines;
+        lines.into_iter().filter(|l| matches!(l, FindLine::AirPlaySearchFailed | FindLine::SendspinSearchFailed)).collect()
+    };
+    assert!(failed().is_empty());
+    *app.sendspin.discovery_error.lock().unwrap() = Some("no socket".into());
+    assert_eq!(failed(), [FindLine::SendspinSearchFailed]);
+    app.set_airplay_discovery_error(Some("no socket".into()));
+    assert_eq!(failed(), [FindLine::AirPlaySearchFailed, FindLine::SendspinSearchFailed]);
+    *app.sendspin.discovery_error.lock().unwrap() = None;
+    assert_eq!(failed(), [FindLine::AirPlaySearchFailed]);
+}
+
+#[test]
+fn music_assistants_page_hears_of_a_public_network_the_app_looks_on() {
+    use crate::discovery_net::NetAdapter;
+    use crate::model::facts::NetworkSeen;
+    use crate::model::situation::ConnKind;
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    app.set_network_adapters(vec![NetAdapter {
+        key: "{0A1B2C3D-0000-0000-0000-000000000001}".into(),
+        name: "Wi-Fi".into(),
+        ipv4: vec!["192.168.1.23".parse().unwrap()],
+    }]);
+    // Before the panel's state is there, nothing is known of the network.
+    assert_eq!(settings.music_assistant().public_network, None);
+    let mut scene = samples::named("kitchen-playing");
+    scene.networks = vec![NetworkSeen {
+        adapter: Some("0A1B2C3D-0000-0000-0000-000000000001".into()),
+        name: Some("HomeNet".into()),
+        private: Some(false),
+        kind: ConnKind::WiFi,
+    }];
+    let port = Arc::new(PortCore::new(view(scene, None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    // Music Assistant isn't connected, and it has to reach this PC.
+    assert_eq!(settings.music_assistant().public_network.as_deref(), Some("HomeNet"));
 }
 
 #[test]
@@ -840,6 +902,27 @@ fn the_playback_check_follows_music_assistants_server() {
     let c = settings.playback_check();
     assert_eq!((c.connected, c.taking, c.volume), (Some(Ok(())), Some(Err(Taking::Paused)), None));
     app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
+fn the_playback_check_says_not_reached_only_where_it_means_something() {
+    use super::real::says_not_reached;
+    use crate::airplay::Reached;
+    // A speaker that follows this PC's clock stays silent until it has
+    // reached this PC.
+    assert!(says_not_reached(Some(Reached::No { silent: true }), false));
+    assert!(says_not_reached(Some(Reached::No { silent: true }), true));
+    // Any other may play without it: said only where Windows Firewall
+    // may be keeping it out.
+    assert!(says_not_reached(Some(Reached::No { silent: false }), true));
+    assert!(!says_not_reached(Some(Reached::No { silent: false }), false));
+    assert!(!says_not_reached(Some(Reached::Yes), true));
+    // Too early to tell, or not an AirPlay speaker.
+    assert!(!says_not_reached(None, true));
+    // With nothing playing to a speaker, the app has no session to ask.
+    let (app, port, _) = real();
+    assert_eq!(app.speaker_reached_this_pc(), None);
+    assert!(!port.playback_check().not_reached);
 }
 
 #[test]

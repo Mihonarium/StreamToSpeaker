@@ -128,6 +128,24 @@ pub fn seen_at(unix: u64, now_unix: u64, offset: i64) -> Seen {
     }
 }
 
+/// Whether the check says that an AirPlay speaker hasn't reached this PC:
+/// of a speaker that stays silent until it has, and of any other on a
+/// network Windows treats as public, where Windows Firewall may be why. A
+/// speaker of the second kind may play without ever reaching this PC.
+pub fn says_not_reached(reached: Option<crate::airplay::Reached>, public: bool) -> bool {
+    matches!(reached, Some(crate::airplay::Reached::No { silent }) if silent || public)
+}
+
+/// The day `unix` fell on, in the zone `offset` seconds from UTC, unless
+/// that is `now_unix`'s own day.
+pub fn earlier_day(unix: u64, now_unix: u64, offset: i64) -> Option<Date> {
+    let day = (unix as i64 + offset).div_euclid(86_400);
+    ((now_unix as i64 + offset).div_euclid(86_400) != day).then(|| {
+        let (_, month, d) = civil_from_days(day);
+        Date { day: d, month }
+    })
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -145,8 +163,6 @@ struct Inner {
     /// Counts the probes started, so a late answer to an earlier *Find*
     /// is dropped.
     probe_seq: u64,
-    /// Music Assistant has played this PC's sound while the app ran.
-    ma_played: bool,
     /// Music Assistant's code whose window was closed.
     ma_code_closed: Option<String>,
     phone_problem: Option<String>,
@@ -561,11 +577,24 @@ impl SettingsPort for AppSettings {
             Some(SourceState::Failed(why)) => (None, Some(why.clone()), false),
             _ => (None, None, false),
         };
-        let played = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.ma_played |= streaming;
-            inner.ma_played.then_some(None)
+        // The last step stays done across restarts: the time it last
+        // played is saved. Today's is said without its date.
+        let played_at = app.user_config.lock().unwrap().sendspin.source_played_unix;
+        let played = if streaming {
+            Some(None)
+        } else {
+            played_at.map(|t| earlier_day(t, now_unix(), self.desktop.utc_offset_secs()))
         };
+        // Music Assistant has to reach this PC. While it hasn't, a network
+        // the app looks on that Windows treats as public is worth saying.
+        let public_network = (found_by.is_none() && failed.is_none())
+            .then(|| find_lines(&app.discovery_net_status().scope, &app.network_adapters(), &self.networks(), 0))
+            .into_iter()
+            .flatten()
+            .find_map(|l| match l {
+                FindLine::Profile { network, private: false } => Some(network),
+                _ => None,
+            });
         MaView {
             offer: app.is_sendspin_available().then(|| app.is_sendspin_source_enabled() || app.user_config.lock().unwrap().sendspin.source_enabled),
             failed,
@@ -576,6 +605,7 @@ impl SettingsPort for AppSettings {
             played,
             paused: app.is_sendspin_pairing_paused(),
             token: app.is_sendspin_source_enabled().then(|| app.sendspin_pairing_token()),
+            public_network,
         }
     }
 
@@ -589,10 +619,7 @@ impl SettingsPort for AppSettings {
                     .into_iter()
                     .map(|r| {
                         let unix = r.at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        let at = match self.seen(unix) {
-                            Seen::Today(t) | Seen::Yesterday(t) => t,
-                            Seen::On(_) => LocalTime::new(0, 0),
-                        };
+                        let at = self.seen(unix);
                         let address = r.address.to_string();
                         let group_of = r.speaker.map(|id| {
                             let id = crate::engine::place_driver::speaker_for_pick(app, &id).as_str().to_owned();
@@ -687,6 +714,7 @@ impl SettingsPort for AppSettings {
             taking: None,
             turned_away: None,
             public_network: None,
+            not_reached: false,
             volume: None,
             untested: false,
             apple_tv: false,
@@ -773,7 +801,20 @@ impl SettingsPort for AppSettings {
                     Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
                 }
             }
-            Some(Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair) => Ok(Taking::CantTell),
+            Some(Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair) => {
+                // An AirPlay speaker keeps time with this PC and has to
+                // reach it for that. Whether one that hasn't plays, the
+                // app still can't tell.
+                let reached = app.speaker_reached_this_pc();
+                if matches!(reached, Some(crate::airplay::Reached::No { .. })) {
+                    let public = self.public_network_toward_speaker();
+                    if says_not_reached(reached, public.is_some()) {
+                        c.not_reached = true;
+                        c.public_network = public;
+                    }
+                }
+                Ok(Taking::CantTell)
+            }
             // Music Assistant's server is connected and hasn't started this
             // PC's sound: the panel's note says the same.
             _ if scene.situation.standing.contains(&Standing::MusicAssistantNotStarted) => Err(Taking::NotAsking { two_ways: false }),

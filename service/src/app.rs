@@ -275,6 +275,16 @@ impl ActiveSession {
         }
     }
 
+    /// What an AirPlay session knows of its speaker reaching this PC;
+    /// `None` for the other kinds of session.
+    pub fn reached(&self) -> Option<crate::airplay::Reached> {
+        match self {
+            ActiveSession::AirPlay(s) => Some(s.reached()),
+            ActiveSession::AirPlay2(s) => Some(s.reached()),
+            ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
+        }
+    }
+
     /// The final fault reported by AirPlay 2. If authentication failed,
     /// the engine treats the receiver as asking for its code. For other
     /// faults it retries while sound is playing.
@@ -528,6 +538,10 @@ fn run_speaker_control(
 const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
 const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
+/// How long an AirPlay speaker has to reach this PC before the app says it
+/// hasn't. Speakers ask for the time every few seconds; the AirPlay 2
+/// clock's own log says so of a silent one after 5 s.
+const REACH_WAIT: Duration = Duration::from_secs(6);
 
 /// What [`App::take_stream_off_number`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1961,15 +1975,15 @@ impl App {
         self.stream_gate.is_granted(peer)
     }
 
-    /// The stream gate for `/stream.raw`, called per request (and once a
-    /// second per open stream) from the HTTP threads, which tell the
-    /// refused device and the log why. Touches only the gate's own brief
-    /// lock — never `session`, which other threads hold across
-    /// multi-second SOAP calls — so a stalled speaker can't park the HTTP
-    /// accept loop. A privacy-mode refusal is surfaced to the user,
-    /// rate-limited per address, naming the device when discovery knows
-    /// it. One while streaming is disabled is only logged: closing the
-    /// stream is what Disable is for.
+    /// The stream gate for a request for `/stream.raw`, called from the
+    /// HTTP threads, which tell the refused device and the log why. An
+    /// admitted request touches only the gate's own brief lock. A
+    /// privacy-mode refusal is noted for the pages with the speaker the
+    /// app was connected to (read under `session`, which other threads
+    /// hold across multi-second SOAP calls: the refused device's answer
+    /// can wait that long) and put in the log, rate-limited per address,
+    /// naming the device when discovery knows it. One while streaming is
+    /// disabled is only logged: closing the stream is what Disable is for.
     pub fn check_stream_client(&self, peer: IpAddr) -> Result<(), Refusal> {
         let verdict = self.stream_gate.check(peer);
         if verdict == Err(Refusal::NotGranted) {
@@ -1977,12 +1991,22 @@ impl App {
         }
         if verdict == Err(Refusal::NotGranted) && self.stream_gate.note_refusal(peer) {
             self.record_error(format!(
-                "Privacy mode refused a connection to the audio stream from {}. \
-                 Turn privacy mode off (Advanced) to let that device listen.",
+                "Refused a connection to the audio stream from {}: only the picked speaker \
+                 may listen. A refused device can be allowed on the speaker's page or the Lab page.",
                 self.describe_peer(peer)
             ));
         }
         verdict
+    }
+
+    /// The stream gate for a stream that is already open, asked once a
+    /// second from its HTTP thread: one the gate stops admitting (the
+    /// sound moved to another place, streaming was disabled) is cut.
+    /// Touches only the gate's own brief lock, so the cut never waits on
+    /// a switch in progress. Nothing is noted: a speaker whose stream
+    /// outlived its turn didn't ask for the sound and get refused.
+    pub fn check_open_stream(&self, peer: IpAddr) -> Result<(), Refusal> {
+        self.stream_gate.check(peer)
     }
 
     /// "Kitchen (192.168.1.50)" when discovery knows the address, else
@@ -2436,6 +2460,18 @@ impl App {
     /// lets it go or connects again.
     pub fn selected_session_dead(&self) -> bool {
         self.session.lock().unwrap().as_ref().is_some_and(|s| s.is_dead())
+    }
+
+    /// What the bound AirPlay session knows of its speaker reaching this
+    /// PC, once the session is old enough for the speaker to have done so.
+    pub(crate) fn speaker_reached_this_pc(&self) -> Option<crate::airplay::Reached> {
+        let (id, reached) = {
+            let guard = self.session.lock().unwrap();
+            let session = guard.as_ref()?;
+            (session.stable_id(), session.reached()?)
+        };
+        let old_enough = self.session_started.lock().unwrap().as_ref().is_some_and(|(of, at)| *of == id && at.elapsed() >= REACH_WAIT);
+        old_enough.then_some(reached)
     }
 
     /// True if any speaker (any transport) is currently bound.
@@ -4235,6 +4271,12 @@ impl App {
         self.discovery_error.lock().unwrap().clone()
     }
 
+    /// Sets why AirPlay speaker discovery isn't running.
+    #[cfg(test)]
+    pub(crate) fn set_airplay_discovery_error(&self, error: Option<String>) {
+        *self.discovery_error.lock().unwrap() = error;
+    }
+
     /// Network check: try again to start an AirPlay browse that failed to
     /// start (nothing else restarts it while the adapter scope holds).
     fn retry_failed_airplay_discovery(&self, scope: &Resolved) {
@@ -4386,8 +4428,8 @@ impl App {
             if let Resolved::Paused { name } = &*self.discovery_scope.lock().unwrap() {
                 self.record_error(format!(
                     "Speaker search is paused: the network adapter \"{}\" is unavailable. \
-                     It resumes when the adapter is back, or choose another adapter in \
-                     Advanced.",
+                     It resumes when the adapter is back; \"Look for speakers on\" under \
+                     \"Speaker missing?\" chooses another.",
                     name
                 ));
             }
@@ -5272,14 +5314,29 @@ impl App {
 
     /// Look at speaker `id` before sound plays on it: whether it answers,
     /// and whether it plays something else where it shows that. A UPnP
-    /// speaker is asked for its transport and what it plays; an AirPlay
-    /// receiver's announcement says whether another device sends to it,
-    /// and otherwise a connection to its control port (with nothing sent
-    /// on it) says whether it answers. Other speakers show nothing: free.
+    /// speaker is asked for its transport and what it plays (one added by
+    /// its address once its description is read, as a connect reads it).
+    /// An AirPlay receiver's announcement says whether another device
+    /// sends to it. Where nothing shows what plays, a connection to the
+    /// port a connect would use (with nothing sent on it) says whether
+    /// the speaker answers: an AirPlay receiver's control port, a Sendspin
+    /// speaker's port. Anything else (Music Assistant, a speaker no search
+    /// lists now) shows nothing: free.
     pub fn look_at_speaker(&self, id: &str) -> crate::engine::signals::SpeakerSignal {
         use crate::engine::signals::{answers_on, SpeakerSignal, STILL_THERE_WAIT};
         let _asking = crate::engine::cancel::asking_speaker();
-        if let Some(r) = self.discovery.as_ref().and_then(|d| d.find_by_id(id)) {
+        let by_address = self.find_manual_speaker(id);
+        let upnp = match self.discovery.as_ref().and_then(|d| d.find_by_id(id)) {
+            Some(r) => Some(r),
+            None => match by_address.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
+                Some(m) => match self.manual_renderer(m) {
+                    Some(r) => Some(r),
+                    None => return SpeakerSignal::NotResponding,
+                },
+                None => None,
+            },
+        };
+        if let Some(r) = upnp {
             let Ok(local) = self.local_ip_toward(r.ip) else { return SpeakerSignal::NotResponding };
             let ours = format!("http://{}/", SocketAddr::new(local, self.config.bind.port()));
             let Ok(state) = upnp::get_transport_state(&r.av_transport_control_url) else {
@@ -5307,7 +5364,30 @@ impl App {
                 SpeakerSignal::NotResponding
             };
         }
-        SpeakerSignal::Free
+        let sendspin = self.sendspin.discovery.lock().unwrap().as_ref().and_then(|d| d.find_by_id(id));
+        let addr = match (sendspin, by_address) {
+            (Some(r), _) => SocketAddr::new(r.ip, r.port),
+            // An AirPlay speaker added by its address that the app hasn't
+            // connected to since it started.
+            (None, Some(m)) => match manual_speakers::resolve_ipv4(&m.host, m.port) {
+                Ok(ip) => SocketAddr::new(IpAddr::V4(ip), m.port),
+                Err(_) => return SpeakerSignal::NotResponding,
+            },
+            (None, None) => return SpeakerSignal::Free,
+        };
+        if answers_on(addr, STILL_THERE_WAIT) {
+            crate::engine::cancel::speaker_answered();
+            SpeakerSignal::Free
+        } else {
+            SpeakerSignal::NotResponding
+        }
+    }
+
+    /// Whether speaker `id` can be asked what it plays: a UPnP speaker,
+    /// found on the network or added by its address.
+    pub(crate) fn says_what_it_plays(&self, id: &str) -> bool {
+        self.discovery.as_ref().is_some_and(|d| d.find_by_id(id).is_some())
+            || self.find_manual_speaker(id).is_some_and(|m| m.kind == ManualKind::Upnp)
     }
 
     /// Whether `r`'s announcement says another device sends to it, unless
@@ -7845,12 +7925,81 @@ mod tests {
     }
 
     #[test]
+    fn a_look_asks_a_sendspin_speaker_whether_it_answers() {
+        use crate::engine::signals::SpeakerSignal;
+        use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
+        let app = test_app();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let found = SendspinDiscoveryState::new();
+        found.insert(SendspinRenderer {
+            instance: "Kitchen".into(),
+            friendly_name: "Kitchen".into(),
+            ip: ip("127.0.0.1"),
+            port: listener.local_addr().unwrap().port(),
+            path: "/sendspin".into(),
+        });
+        *app.sendspin.discovery.lock().unwrap() = Some(found);
+        assert_eq!(app.look_at_speaker("sendspin:kitchen"), SpeakerSignal::Free);
+        // Switched off while its announcement is still remembered: it
+        // isn't taken for a speaker that can play again.
+        drop(listener);
+        assert_eq!(app.look_at_speaker("sendspin:kitchen"), SpeakerSignal::NotResponding);
+    }
+
+    #[test]
+    fn a_look_asks_a_speaker_added_by_its_address() {
+        use crate::engine::signals::SpeakerSignal;
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("GetTransportInfo") => Reply::soap_ok(AV_TRANSPORT, "GetTransportInfo", &[("CurrentTransportState", "PLAYING")]),
+            Some("GetMediaInfo") => Reply::soap_ok(AV_TRANSPORT, "GetMediaInfo", &[("CurrentURI", "x-sonos-spotify:track")]),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::ok(&renderer_description("Den Amp", &[])),
+        });
+        let app = test_app();
+        let upnp = manual_upnp(&fake);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let airplay = ManualSpeaker { kind: ManualKind::AirPlay, name: "Study".into(), host: "127.0.0.1".into(), port };
+        // A UPnP speaker whose description nothing serves once the
+        // listener is closed.
+        let gone = ManualSpeaker { kind: ManualKind::Upnp, name: "Den".into(), host: format!("http://127.0.0.1:{port}/description.xml"), port: 0 };
+        app.user_config.lock().unwrap().manual_speakers.extend([upnp.clone(), airplay.clone(), gone.clone()]);
+        assert!(app.says_what_it_plays(&upnp.id()) && !app.says_what_it_plays(&airplay.id()));
+        assert_eq!(app.look_at_speaker(&upnp.id()), SpeakerSignal::PlayingElse { who: None });
+        assert_eq!(app.look_at_speaker(&airplay.id()), SpeakerSignal::Free);
+        // Switched off: neither kind is taken for a speaker that can play.
+        drop(listener);
+        assert_eq!(app.look_at_speaker(&airplay.id()), SpeakerSignal::NotResponding);
+        assert_eq!(app.look_at_speaker(&gone.id()), SpeakerSignal::NotResponding);
+    }
+
+    #[test]
+    fn a_stream_cut_when_the_sound_moves_on_is_not_a_refused_device() {
+        let app = test_app();
+        let peer = ip("192.168.1.34");
+        let grant = app.stream_gate.grant([peer]);
+        assert_eq!(app.check_stream_client(peer), Ok(()));
+        assert_eq!(app.check_open_stream(peer), Ok(()));
+        // The sound moved elsewhere: the stream that is still open is cut,
+        // and its speaker isn't listed as a device that asked and was
+        // refused.
+        drop(grant);
+        assert_eq!(app.check_open_stream(peer), Err(Refusal::NotGranted));
+        assert!(app.recently_refused().is_empty());
+        assert_eq!(app.current_error(), None);
+        // A device that asks afresh is.
+        assert_eq!(app.check_stream_client(peer), Err(Refusal::NotGranted));
+        assert_eq!(app.recently_refused().len(), 1);
+    }
+
+    #[test]
     fn refusal_is_surfaced_once_per_peer() {
         let app = test_app();
         assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
         let msg = app.current_error().expect("refusal recorded as a user-visible error");
         assert!(msg.contains("192.168.1.99"), "{msg}");
-        assert!(msg.contains("privacy mode off"), "{msg}");
+        assert!(msg.contains("can be allowed on the speaker's page"), "{msg}");
         // A repeat within the report interval is refused silently.
         app.dismiss_error();
         assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
@@ -8438,6 +8587,27 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `--player "Music Assistant"`: Music Assistant is listed once its
+    /// server is connected, so the wish waits for the server and picks
+    /// Music Assistant then.
+    #[test]
+    fn a_player_wish_for_music_assistant_waits_for_its_server() {
+        use crate::sendspin::source::SourceState;
+        use crate::sendspin_app::MA_OUTPUT_ID;
+        let app = test_app();
+        app.set_sendspin_source_enabled(true).unwrap();
+        app.connect_when_listed_every("Music Assistant".into(), Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.player_wish(), Some(PlayerWish::Looking { query: "Music Assistant".into() }));
+        assert!(!app.is_speaker_bound());
+        app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+        let chosen = || app.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == MA_OUTPUT_ID);
+        assert!(eventually(chosen), "{:?} {:?}", app.player_wish(), app.current_error());
+        // The wait is over once it plays there.
+        assert!(eventually(|| app.player_wish().is_none()), "{:?}", app.player_wish());
+        app.set_sendspin_source_enabled(false).unwrap();
     }
 
     #[test]

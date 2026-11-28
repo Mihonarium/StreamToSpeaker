@@ -65,6 +65,11 @@ pub struct SendspinConfig {
     /// pairing (or since the user allowed pairing again).
     #[serde(default)]
     pub pairing_code_failures: u32,
+    /// When a server last started playing this PC's sound (Unix seconds,
+    /// kept to the hour: see [`SendspinConfig::note_played`]). By it the
+    /// Music Assistant page's last step stays done across restarts.
+    #[serde(default)]
+    pub source_played_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +194,17 @@ impl SendspinConfig {
             r.last_used_unix = now;
         }
     }
+
+    /// A server started playing this PC's sound at `now`. Returns whether
+    /// that is worth saving: the pages show only the day, so a start
+    /// within an hour of the saved one isn't.
+    pub fn note_played(&mut self, now: u64) -> bool {
+        if self.source_played_unix.is_some_and(|t| now.abs_diff(t) < 3600) {
+            return false;
+        }
+        self.source_played_unix = Some(now);
+        true
+    }
 }
 
 fn ensure_key(slot: &mut Option<String>) -> ([u8; 32], bool) {
@@ -282,6 +298,7 @@ mod tests {
             "source_enabled",
             "source_name",
             "source_own_switch",
+            "source_played_unix",
         ];
         let mut expected: Vec<&str> =
             settings.iter().copied().chain(groups.iter().flat_map(|g| g.fields.iter().copied())).collect();
@@ -293,6 +310,19 @@ mod tests {
             assert!(!keys.iter().any(|k| k.starts_with(g.name)), "{} is filed under a field name", g.name);
             assert!(g.pairings.iter().all(|p| g.fields.contains(p)));
         }
+    }
+
+    #[test]
+    fn a_server_playing_is_saved_once_an_hour() {
+        let mut c = SendspinConfig::default();
+        assert!(c.note_played(1_000_000));
+        assert!(!c.note_played(1_003_599));
+        assert_eq!(c.source_played_unix, Some(1_000_000));
+        assert!(c.note_played(1_003_600));
+        // A saved time ahead of the clock (the clock was set back) is
+        // replaced.
+        assert!(c.note_played(900_000));
+        assert_eq!(c.source_played_unix, Some(900_000));
     }
 
     #[test]

@@ -279,7 +279,7 @@ pub fn open_windows_page(page: super::content::WindowsPage) {
         // ShellExecute's handlers may need.
         let hr = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
         // SAFETY: both strings are NUL-terminated and outlive the call; the
-        // address is one of three fixed ms-settings: pages.
+        // address is one of the fixed ms-settings: pages.
         let rc = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
         if hr >= 0 {
             // SAFETY: balances the successful CoInitializeEx above.

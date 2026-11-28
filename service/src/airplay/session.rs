@@ -452,6 +452,8 @@ pub struct AirPlaySession {
     first_packet: (u16, u32),
     /// Retransmission counters, fed by the resend responder.
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
+    /// Set once the receiver has asked this PC for the time.
+    asked_for_time: Arc<AtomicBool>,
     /// Current RTP write head — read to stamp the `RTP-Info` on metadata
     /// SET_PARAMETERs.
     current_rtptime: Arc<AtomicU32>,
@@ -607,12 +609,14 @@ impl AirPlaySession {
         let dead = Arc::new(AtomicBool::new(false));
         let ended_by_receiver = Arc::new(AtomicBool::new(false));
         let resend_stats = Arc::new(crate::airplay::timing::ResendStats::default());
+        let asked_for_time = Arc::new(AtomicBool::new(false));
         let mut guard = SpawnGuard::new(stop_flag.clone());
         guard.adopt(
             spawn_timing_responder(
                 timing_socket,
                 stop_flag.clone(),
                 cfg.renderer.friendly_name.clone(),
+                asked_for_time.clone(),
             )
             .context("spawning AirPlay timing responder")?,
         );
@@ -849,6 +853,7 @@ impl AirPlaySession {
             ended_by_receiver,
             first_packet: (initial_seq, initial_rtptime),
             resend_stats,
+            asked_for_time,
             current_rtptime,
             volume_pct: Arc::new(AtomicU32::new(cfg.initial_volume.unwrap_or(100))),
             threads: guard.into_threads(),
@@ -900,6 +905,15 @@ impl AirPlaySession {
     /// it for a dropout.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// Whether the receiver has reached this PC since the session
+    /// started: it asks this PC for the time it plays by.
+    pub fn reached(&self) -> crate::airplay::Reached {
+        match self.asked_for_time.load(Ordering::Acquire) {
+            true => crate::airplay::Reached::Yes,
+            false => crate::airplay::Reached::No { silent: false },
+        }
     }
 
     /// The `DACP-ID` and `Active-Remote` this session's requests carry:
@@ -1434,6 +1448,30 @@ mod tests {
     use super::*;
     use crate::airplay::fake_raop::{Answer, FakeRaop};
     use crate::airplay::raop_transcripts::{config, receiver};
+
+    /// The session knows once its receiver has asked this PC for the
+    /// time, at the port the session named in SETUP.
+    #[test]
+    fn the_session_knows_once_its_receiver_has_reached_this_pc() {
+        use crate::airplay::Reached;
+        let rx = FakeRaop::start(|_| Answer::Normal);
+        let (_tx, samples) = crossbeam_channel::unbounded();
+        let session = AirPlaySession::start(config(receiver(&rx, "0B00000000A1", &[0, 1]), samples)).expect("session up");
+        assert_eq!(session.reached(), Reached::No { silent: false });
+        let setup = rx.requests().into_iter().find(|r| r.method == "SETUP").expect("SETUP was sent");
+        let transport = setup.header("Transport").expect("SETUP names the ports").to_string();
+        let port: u16 = transport.split(';').find_map(|p| p.strip_prefix("timing_port=")).expect("a timing port").parse().unwrap();
+        let mut request = [0u8; 32];
+        request[0] = 0x80;
+        request[1] = 0xD2;
+        UdpSocket::bind("127.0.0.1:0").unwrap().send_to(&request, ("127.0.0.1", port)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while session.reached() != Reached::Yes && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.reached(), Reached::Yes);
+        session.stop();
+    }
 
     /// `stop()` doesn't wait behind a keepalive the receiver leaves
     /// unanswered: the stalled request is cut off, and TEARDOWN still

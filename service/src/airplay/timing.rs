@@ -111,11 +111,13 @@ pub fn ntp_now() -> u64 {
 }
 
 /// Spawn the timing responder. Owns the timing socket. Exits when
-/// `stop_flag` is set OR when the socket errors persistently.
+/// `stop_flag` is set OR when the socket errors persistently. `asked` is
+/// set at the receiver's first request: the receiver has reached this PC.
 pub fn spawn_timing_responder(
     timing_socket: UdpSocket,
     stop_flag: Arc<AtomicBool>,
     receiver_name: String,
+    asked: Arc<AtomicBool>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     timing_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     thread::Builder::new()
@@ -135,6 +137,7 @@ pub fn spawn_timing_responder(
                         );
                         served += 1;
                         if served == 1 {
+                            asked.store(true, Ordering::Release);
                             info!(
                                 "AirPlay NTP timing: receiver engaged (first timing request from {})",
                                 peer
@@ -320,6 +323,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The responder answers a timing request and says that the receiver
+    /// has asked.
+    #[test]
+    fn the_first_timing_request_says_the_receiver_reached_us() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = socket.local_addr().unwrap();
+        let (stop, asked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let responder = spawn_timing_responder(socket, stop.clone(), "test".into(), asked.clone()).unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(!asked.load(Ordering::Acquire));
+        let mut request = [0u8; 32];
+        request[0] = 0x80;
+        request[1] = 0xD2;
+        receiver.send_to(&request, to).unwrap();
+        let mut reply = [0u8; 64];
+        let (n, _) = receiver.recv_from(&mut reply).expect("the request is answered");
+        assert_eq!((n, reply[1]), (32, 0xD3));
+        // The responder notes it right after it answers.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !asked.load(Ordering::Acquire) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(asked.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        responder.join().unwrap();
+    }
 
     #[test]
     fn control_traffic_only_from_the_receiver() {

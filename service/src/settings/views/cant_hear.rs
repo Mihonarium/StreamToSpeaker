@@ -204,7 +204,7 @@ impl ViewContent for CantHearView {
             };
             match r {
                 Ok(Taking::CantTell) | Err(Taking::CantTell) => {
-                    check_line(ui, Found::Unknown, &w!(lang, SetCheckCantTell, speaker = &speaker), Some(&w!(lang, SetCheckCantTellLine)), |ui| {
+                    let again = |ui: &mut Ui, ask: &mut dyn FnMut(Ask)| {
                         buttons(ui, |ui| {
                             reconnect(ui, ask);
                             if c.on_short && Button::standard(&w!(lang, SetTrySteady)).show(ui).clicked() {
@@ -213,7 +213,38 @@ impl ViewContent for CantHearView {
                                 }
                             }
                         });
-                    });
+                    };
+                    if c.not_reached {
+                        // An AirPlay speaker keeps time with this PC and
+                        // connects back to it for that. One that hasn't
+                        // is where the sound most likely stops: the step
+                        // says so, then what may be why with the way to
+                        // it, and only then offers to try again.
+                        all_good = false;
+                        check_line(ui, Found::Warning, &w!(lang, SetCheckNotReached, speaker = &speaker), Some(&w!(lang, SetCheckNotReachedLine)), |ui| {
+                            ui.add_space(6.0);
+                            match &c.public_network {
+                                Some(network) => {
+                                    check_line(ui, Found::Warning, &w!(lang, SetFindPublic, network = network), Some(&w!(lang, SetCheckPublicAirPlayLine, speaker = &speaker)), |ui| {
+                                        if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
+                                            ask(Ask::Open(crate::model::command::Open::NetworkSettings));
+                                        }
+                                    });
+                                }
+                                None => {
+                                    check_line(ui, Found::Info, &w!(lang, SetCheckFirewall, speaker = &speaker), Some(&w!(lang, SetCheckFirewallLine, speaker = &speaker)), |ui| {
+                                        if Button::standard(&w!(lang, SetOpenWindowsSecurity)).show(ui).clicked() {
+                                            ask(Ask::Open(crate::model::command::Open::WindowsSecurity));
+                                        }
+                                    });
+                                }
+                            }
+                            ui.add_space(8.0);
+                            again(ui, ask);
+                        });
+                    } else {
+                        check_line(ui, Found::Unknown, &w!(lang, SetCheckCantTell, speaker = &speaker), Some(&w!(lang, SetCheckCantTellLine)), |ui| again(ui, ask));
+                    }
                 }
                 Ok(_) => check_line(ui, Found::Good, &w!(lang, SetCheckTaking, speaker = &speaker), None, |_| ()),
                 Err(Taking::NotAsking { .. }) if id.as_ref().is_some_and(SpeakerId::is_music_assistant) => {

@@ -206,6 +206,9 @@ pub enum Open {
     VolumeMixer,
     /// Windows: the network's settings (to make it private).
     NetworkSettings,
+    /// Windows: the Windows Security page of Settings, on the way to the
+    /// firewall's list of allowed apps.
+    WindowsSecurity,
 }
 
 /// Why a command did nothing.

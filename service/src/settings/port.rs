@@ -241,6 +241,10 @@ pub struct MaView {
     pub paused: bool,
     /// The token for another Sendspin server.
     pub token: Option<String>,
+    /// Music Assistant isn't connected, and Windows treats this network,
+    /// which the app looks on, as public. Windows Firewall, which the app
+    /// doesn't read, may keep Music Assistant from reaching this PC.
+    pub public_network: Option<String>,
 }
 
 // -------------------------------------------------------------------------
@@ -262,7 +266,8 @@ pub struct Refused {
     /// The device's name, when it said one.
     pub name: Option<String>,
     pub address: String,
-    pub at: LocalTime,
+    /// When it asked.
+    pub at: Seen,
     /// The speaker whose group it belongs to: it can be allowed for it.
     pub group_of: Option<(String, String)>,
 }
@@ -405,10 +410,17 @@ pub struct PlaybackCheck {
     /// says what happened; a device is allowed on the speaker's page.
     pub turned_away: Option<TurnedAway>,
     /// While the speaker isn't asking for the sound and no device was
-    /// turned away: the network this PC reaches the speaker over, where
-    /// Windows treats it as public. Windows Firewall, which the app
-    /// doesn't read, may keep the speaker from reaching this PC there.
+    /// turned away, or while an AirPlay speaker hasn't reached this PC:
+    /// the network this PC reaches the speaker over, where Windows treats
+    /// it as public. Windows Firewall, which the app doesn't read, may
+    /// keep the speaker from reaching this PC there.
     pub public_network: Option<String>,
+    /// While the app can't tell whether an AirPlay speaker plays: the
+    /// speaker hasn't reached this PC since it was connected, which it
+    /// has to do to keep time with it. Said of a speaker known to stay
+    /// silent until it does, and where `public_network` names what may
+    /// be why.
+    pub not_reached: bool,
     pub volume: Link<Volume>,
     /// Routes nobody has tried on real hardware.
     pub untested: bool,

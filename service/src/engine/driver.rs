@@ -230,8 +230,11 @@ pub(super) fn refusal(why: crate::delay::Unchangeable, speaker: &crate::model::S
     }
 }
 
+/// Whether speaker `id` plays something else now, where it shows that
+/// (`Some`), with the name of the other PC that plays there when its
+/// title says so.
 pub(super) fn busy(app: &App, id: &str) -> Option<Option<String>> {
-    if app.discovery.as_ref().is_some_and(|d| d.find_by_id(id).is_some()) {
+    if app.says_what_it_plays(id) {
         return match app.look_at_speaker(id) {
             SpeakerSignal::PlayingElse { who } => Some(who),
             _ => None,
@@ -284,6 +287,23 @@ mod tests {
         assert_eq!(windows.handbacks(), 1);
         assert_eq!(windows.default_output(), pc);
         assert_eq!(windows.calls_output(), pc);
+    }
+
+    #[test]
+    fn a_speaker_added_by_its_address_that_plays_something_else_is_busy() {
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        use crate::manual_speakers::{ManualKind, ManualSpeaker};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("GetTransportInfo") => Reply::soap_ok(AV_TRANSPORT, "GetTransportInfo", &[("CurrentTransportState", "PLAYING")]),
+            Some("GetMediaInfo") => Reply::soap_ok(AV_TRANSPORT, "GetMediaInfo", &[("CurrentURI", "x-sonos-spotify:track")]),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::ok(&renderer_description("Den Amp", &[])),
+        });
+        let app = App::for_tests();
+        let m = ManualSpeaker { kind: ManualKind::Upnp, name: String::new(), host: fake.url("/description.xml"), port: 0 };
+        app.user_config.lock().unwrap().manual_speakers.push(m.clone());
+        assert_eq!(busy(&app, &m.id()), Some(None));
+        assert_eq!(fake.soap_actions(), ["GetTransportInfo", "GetMediaInfo"]);
     }
 
     #[test]

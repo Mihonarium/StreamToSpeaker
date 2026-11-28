@@ -247,7 +247,8 @@ pub struct UserConfig {
     /// own.
     #[serde(default = "default_homepod_latency_ms")]
     pub airplay_homepod_latency_ms: u32,
-    /// Once-a-day check for a newer release on GitHub (Advanced toggle).
+    /// Once-a-day check for a newer release on GitHub (the About page's
+    /// switch).
     /// One unauthenticated GET of the releases API; nothing is downloaded
     /// or installed. On by default. See `update_check`.
     #[serde(default = "default_true")]
@@ -2249,6 +2250,7 @@ mod tests {
         c.sendspin.player_extra_latency_ms = 40;
         c.sendspin.pairing_code_failures = 2;
         c.sendspin.source_own_switch = true;
+        c.sendspin.source_played_unix = Some(1_700_000_200);
         c.manual_speakers.push(ManualSpeaker {
             kind: ManualKind::AirPlay,
             name: "Den".into(),

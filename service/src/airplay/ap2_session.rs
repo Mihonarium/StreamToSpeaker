@@ -202,6 +202,9 @@ pub struct AirPlay2Session {
     /// Retransmission counters (realtime stream only; buffered has no
     /// resend path and leaves them at zero).
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
+    /// Set once the receiver has asked this PC for the time (a session
+    /// that keeps time over NTP; the others have `ptp_session`).
+    asked_for_time: Arc<AtomicBool>,
     threads: SessionThreads,
     ptp_session: Option<PtpMaster>,
     /// (next 23-bit seq, next rtptime) for the buffered stream — read at
@@ -435,6 +438,7 @@ impl AirPlay2Session {
         let initial_rtptime = random_initial_rtptime();
         let ssrc = random_ssrc();
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
+        let asked_for_time = Arc::new(AtomicBool::new(false));
 
         // The control socket carries outbound sync packets and inbound
         // resend requests — clone it so both threads can use it.
@@ -512,6 +516,7 @@ impl AirPlay2Session {
                     timing_socket,
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
+                    asked_for_time.clone(),
                 )
                 .context("spawning AP2 timing responder")?;
                 bring_up.threads.timing = Some(timing);
@@ -612,6 +617,7 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
+            asked_for_time,
             threads,
             ptp_session,
             buffered_flush,
@@ -879,6 +885,7 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
+            asked_for_time: Arc::new(AtomicBool::new(false)),
             threads,
             ptp_session,
             buffered_flush: None,
@@ -892,6 +899,22 @@ impl AirPlay2Session {
     /// receiver). The engine looks at it for a dropout.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// Whether the receiver has reached this PC since the session
+    /// started. A receiver that follows this PC's clock answers it, and
+    /// plays nothing until it has; any other asks this PC for the time.
+    pub fn reached(&self) -> crate::airplay::Reached {
+        use crate::airplay::Reached;
+        let (heard, silent) = match &self.ptp_session {
+            Some(ptp) => (ptp.timeline.heard_from_receiver(), true),
+            None => (self.asked_for_time.load(Ordering::Acquire), false),
+        };
+        if heard {
+            Reached::Yes
+        } else {
+            Reached::No { silent }
+        }
     }
 
     /// Whether the session runs the buffered stream, whose delay is its
@@ -1504,7 +1527,7 @@ fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String, pl
     }
     faults.raise_unless_repeated("encoder_failed", FaultChannel::Media, detail, played, || {
         "Windows' AAC encoder failed again after reconnecting. The realtime stream doesn't use \
-         it: turn on \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
+         it: choose \"Less delay\" on the speaker's page, then select the speaker again."
             .to_string()
     });
 }
@@ -1598,11 +1621,11 @@ fn anchor_failed_message(
              then select the speaker again.",
             crate::PRODUCT_NAME
         ),
-        AnchorAdvice::FollowsOurClock if homepod => "it refused to start playing on this PC's clock. Turn off \
-             \"Use the buffered stream for single HomePods\" in Advanced, then select it again."
+        AnchorAdvice::FollowsOurClock if homepod => "it refused to start playing on this PC's clock. Choose \
+             \"Less delay\" on the HomePod's page, then select it again."
             .to_string(),
-        AnchorAdvice::FollowsOurClock => "it refused to start playing on this PC's clock. Turn on \
-             \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
+        AnchorAdvice::FollowsOurClock => "it refused to start playing on this PC's clock. Choose \
+             \"Less delay\" on the speaker's page, then select the speaker again."
             .to_string(),
         AnchorAdvice::RefusedOnItsClock => {
             "it refused to start playing, although this PC was following its clock. Select it again.".to_string()
@@ -2297,7 +2320,7 @@ mod tests {
             let fault = rig.faults.get().unwrap();
             assert_eq!((fault.code, fault.retryable), ("encoder_failed", retryable), "round {round}");
             if !retryable {
-                assert!(fault.to_string().contains("Prefer low-latency realtime"), "{fault}");
+                assert!(fault.to_string().contains("\"Less delay\" on the speaker's page"), "{fault}");
             }
         }
     }
@@ -2338,8 +2361,8 @@ mod tests {
         assert!(neutral.contains("could not open UDP port 319") && !neutral.contains("program"), "{neutral}");
         let firewall = text(&refused, None, none, false);
         assert!(firewall.contains("Windows Firewall") && !firewall.contains("private"), "{firewall}");
-        assert!(text(&refused, None, follows_us, false).contains("Prefer low-latency realtime"));
-        assert!(text(&refused, None, follows_us, true).contains("Use the buffered stream for single HomePods"));
+        assert!(text(&refused, None, follows_us, false).contains("\"Less delay\" on the speaker's page"));
+        assert!(text(&refused, None, follows_us, true).contains("\"Less delay\" on the HomePod's page"));
         assert!(!text(&refused, None, locked, false).contains("Firewall"));
     }
 

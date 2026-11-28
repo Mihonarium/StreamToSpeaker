@@ -510,6 +510,20 @@ fn quitting_explains_the_silence_only_for_chosen_apps() {
 }
 
 #[test]
+fn a_refused_device_of_an_earlier_day_says_which_day() {
+    use crate::model::text::LocalTime;
+    let row = |at: Seen| {
+        let port = scripted(move |s| s.privacy.refused.as_mut().unwrap()[1].at = at);
+        H::new(port.clone(), Box::new(super::LabView::new(port)), snap("kitchen-playing"))
+    };
+    // Today's goes by its time alone.
+    let today = row(Seen::Today(LocalTime::new(21, 12)));
+    assert!(today.shows("192.168.1.77 (unknown device) · 21:12") && !today.shows("today"));
+    assert!(row(Seen::Yesterday(LocalTime::new(22, 10))).shows("192.168.1.77 (unknown device) · yesterday 22:10"));
+    assert!(row(Seen::On(Date { day: 3, month: 10 })).shows("192.168.1.77 (unknown device) · 3 October"));
+}
+
+#[test]
 fn each_settings_switch_changes_its_own_field() {
     let port = scripted(|s| { s.general.shortcuts.as_mut().unwrap().on = false; s.ma.offer = Some(false); });
     let mut h = H::new(port.clone(), Box::new(SettingsView::new(port)), snap("kitchen-playing"));
@@ -689,6 +703,19 @@ fn cant_hear_says_what_the_panel_says_while_the_app_connects_by_itself() {
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-not-responding-trying"));
     assert!(h.has("Connecting to Kitchen…") && h.shows("Not responding. Trying again…"));
     assert!(!h.has("Not connected.") && !h.has("Connect"));
+    // Music Assistant picked a moment ago, its server not connected yet:
+    // the app is still waiting for it, so the step says that, and not yet
+    // that Music Assistant isn't connected.
+    let port = scripted(|s| {
+        s.playback.speaker = Some("Music Assistant".into());
+        s.playback.connected = Some(Err(()));
+        s.playback.server_away = true;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-connecting"));
+    assert!(h.has("Connecting to Music Assistant…"));
+    assert!(!h.has("Music Assistant isn’t connected.") && !h.has("How to connect it") && !h.has("Connect"));
     // Nothing under way: the step is broken, and Connect is its fix.
     let port = not_connected();
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port.clone())), snap("kitchen-playing"));
@@ -851,7 +878,7 @@ fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
     // matters here: the speaker has to reach this PC for the sound.
     assert!(h.has("Windows treats “HomeNet” as a public network."));
     assert!(h.shows("Kitchen fetches the sound from this PC, and on a public network Windows Firewall may stop it."));
-    assert!(h.shows("choose Private in its properties in Windows’ network settings, then try Kitchen again."));
+    assert!(h.shows("open its properties in Windows’ network settings and choose Private, then try Kitchen again."));
     h.click("Open network settings");
     assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
     assert_eq!(h.acts(), vec![]);
@@ -860,6 +887,50 @@ fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
     let port = not_asking(None);
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     assert!(h.has("Try Kitchen again") && !h.shows("public network") && !h.has("Open network settings"));
+}
+
+#[test]
+fn cant_hear_says_when_an_airplay_speaker_hasnt_reached_this_pc() {
+    let cant_tell = |not_reached: bool, network: Option<&str>| {
+        let network = network.map(String::from);
+        scripted(move |s| {
+            s.playback.taking = Some(Ok(Taking::CantTell));
+            s.playback.not_reached = not_reached;
+            s.playback.public_network = network;
+        })
+    };
+    // On a network Windows treats as public: the step says what is wrong,
+    // then what the search check says of the network with the way to
+    // Windows' settings, and only then offers to try again. The page says
+    // neither that it can't tell nor that all looks right.
+    let port = cant_tell(true, Some("HomeNet"));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen hasn’t connected back to this PC.") && h.has("Try Kitchen again"));
+    assert!(h.shows("An AirPlay speaker connects back to the PC it plays from"));
+    assert!(h.has("Windows treats “HomeNet” as a public network."));
+    assert!(h.shows("On a public network, Windows Firewall may be stopping Kitchen.") && h.shows("then try Kitchen again."));
+    assert!(!h.has("This PC can’t tell whether Kitchen is playing.") && !h.shows("Everything this PC can check looks right."));
+    assert!(!h.has("Open Windows Security"));
+    h.click("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    assert_eq!(h.acts(), vec![]);
+    // On any other network, of a speaker that stays silent until it has
+    // connected back: a firewall on this PC is what may be why, with the
+    // way to Windows' list of the apps its firewall lets through.
+    let port = cant_tell(true, None);
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen hasn’t connected back to this PC.") && h.has("Try Kitchen again"));
+    assert!(h.has("A firewall on this PC may be stopping Kitchen."));
+    assert!(h.shows("choose Allow an app through firewall") && h.shows("Then try Kitchen again."));
+    assert!(!h.shows("public network") && !h.has("Open network settings") && !h.shows("Everything this PC can check looks right."));
+    h.click("Open Windows Security");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::WindowsSecurity)]);
+    assert_eq!(h.acts(), vec![]);
+    // A speaker that has connected back: the page says nothing of it.
+    let port = cant_tell(false, None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("This PC can’t tell whether Kitchen is playing."));
+    assert!(!h.shows("connected back") && h.shows("Everything this PC can check looks right."));
 }
 
 #[test]
@@ -917,6 +988,34 @@ fn cant_hear_says_why_the_sound_stayed_on_this_pc() {
     let port = scripted(|s| s.playback.speaker = None);
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("pc-plain"));
     assert!(h.has("Your sound is on this PC.") && h.shows("Pick a speaker in the panel") && !h.shows("Windows didn’t switch"));
+}
+
+#[test]
+fn music_assistant_says_when_a_public_network_may_keep_it_out() {
+    let line = "Windows treats “HomeNet” as a public network";
+    // Not found yet: under the first step, with the way to Windows'
+    // network settings.
+    let port = scripted(|s| {
+        s.ma.public_network = Some("HomeNet".into());
+        s.ma.found_by = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(h.shows(line));
+    h.click_link("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    // Set up earlier and not connected now.
+    let port = scripted(|s| {
+        s.ma.public_network = Some("HomeNet".into());
+        s.ma.found_by = None;
+        s.ma.code = None;
+        s.ma.paired_with = vec!["Music Assistant (Home)".into()];
+    });
+    let h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(h.shows(line) && h.shows("isn’t connected to this PC right now"));
+    // Connected: the page says nothing about the network.
+    let port = scripted(|s| s.ma.public_network = Some("HomeNet".into()));
+    let h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(!h.shows(line));
 }
 
 #[test]
@@ -1125,6 +1224,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     a_busy_chime_asks_in_the_page_before_playing();
     the_discovery_check_explains_why_search_is_off();
     cant_hear_says_which_device_privacy_turned_away_and_allows_nothing();
+    cant_hear_says_when_an_airplay_speaker_hasnt_reached_this_pc();
     cant_hear_says_why_the_sound_stayed_on_this_pc();
     tone_name_and_speaker_commands();
     the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();
@@ -1225,6 +1325,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.found_by = None;
             s.ma.code = None;
             s.ma.paired_with = vec!["x".into()];
+            s.ma.public_network = Some("HomeNet".into());
         },
         |s| s.about.updates.state = UpdateState::DevBuild,
         |s| {
