@@ -128,6 +128,16 @@ pub fn seen_at(unix: u64, now_unix: u64, offset: i64) -> Seen {
     }
 }
 
+/// The day `unix` fell on, in the zone `offset` seconds from UTC, unless
+/// that is `now_unix`'s own day.
+pub fn earlier_day(unix: u64, now_unix: u64, offset: i64) -> Option<Date> {
+    let day = (unix as i64 + offset).div_euclid(86_400);
+    ((now_unix as i64 + offset).div_euclid(86_400) != day).then(|| {
+        let (_, month, d) = civil_from_days(day);
+        Date { day: d, month }
+    })
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -145,8 +155,6 @@ struct Inner {
     /// Counts the probes started, so a late answer to an earlier *Find*
     /// is dropped.
     probe_seq: u64,
-    /// Music Assistant has played this PC's sound while the app ran.
-    ma_played: bool,
     /// Music Assistant's code whose window was closed.
     ma_code_closed: Option<String>,
     phone_problem: Option<String>,
@@ -561,10 +569,13 @@ impl SettingsPort for AppSettings {
             Some(SourceState::Failed(why)) => (None, Some(why.clone()), false),
             _ => (None, None, false),
         };
-        let played = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.ma_played |= streaming;
-            inner.ma_played.then_some(None)
+        // The last step stays done across restarts: the time it last
+        // played is saved. Today's is said without its date.
+        let played_at = app.user_config.lock().unwrap().sendspin.source_played_unix;
+        let played = if streaming {
+            Some(None)
+        } else {
+            played_at.map(|t| earlier_day(t, now_unix(), self.desktop.utc_offset_secs()))
         };
         MaView {
             offer: app.is_sendspin_available().then(|| app.is_sendspin_source_enabled() || app.user_config.lock().unwrap().sendspin.source_enabled),

@@ -584,6 +584,25 @@ fn values_from_an_earlier_version_are_carried_over_not_lab_settings() {
 }
 
 #[test]
+fn music_assistant_having_played_is_remembered_across_starts() {
+    use super::real::earlier_day;
+    let (app, port, _desk) = real();
+    assert_eq!(port.music_assistant().played, None);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // It played three days ago, and the app has started since.
+    app.user_config.lock().unwrap().sendspin.source_played_unix = Some(now - 3 * 86_400);
+    assert!(matches!(port.music_assistant().played, Some(Some(_))), "{:?}", port.music_assistant().played);
+    // Today's is said without its date.
+    app.user_config.lock().unwrap().sendspin.source_played_unix = Some(now);
+    assert_eq!(port.music_assistant().played, Some(None));
+    // 2026-11-23 12:00 UTC, an hour east of it.
+    let noon = 1_795_435_200;
+    assert_eq!(earlier_day(noon - 3 * 3600, noon, 3600), None);
+    assert_eq!(earlier_day(noon - 20 * 3600, noon, 3600), Some(Date { day: 22, month: 11 }));
+    assert_eq!(earlier_day(noon - 50 * 86_400, noon, 3600), Some(Date { day: 4, month: 10 }));
+}
+
+#[test]
 fn a_moment_is_said_as_today_yesterday_or_a_date() {
     use super::real::seen_at;
     // 2026-11-23 12:00 UTC, an hour east of it.

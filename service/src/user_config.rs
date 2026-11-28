@@ -2250,6 +2250,7 @@ mod tests {
         c.sendspin.player_extra_latency_ms = 40;
         c.sendspin.pairing_code_failures = 2;
         c.sendspin.source_own_switch = true;
+        c.sendspin.source_played_unix = Some(1_700_000_200);
         c.manual_speakers.push(ManualSpeaker {
             kind: ManualKind::AirPlay,
             name: "Den".into(),
