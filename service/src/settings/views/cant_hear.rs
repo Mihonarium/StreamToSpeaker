@@ -244,6 +244,16 @@ impl ViewContent for CantHearView {
                             }
                         });
                     });
+                    if let Some(network) = &c.public_network {
+                        // The search check's caution, where it bites: no
+                        // device reached the app for the sound, on a
+                        // network Windows treats as public.
+                        check_line(ui, Found::Warning, &w!(lang, SetFindPublic, network = network), Some(&w!(lang, SetFindPublicLine)), |ui| {
+                            if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
+                                ask(Ask::Open(crate::model::command::Open::NetworkSettings));
+                            }
+                        });
+                    }
                     if let Some(away) = &c.turned_away {
                         // A device privacy turned away while nothing
                         // fetches the sound. Whether it plays the

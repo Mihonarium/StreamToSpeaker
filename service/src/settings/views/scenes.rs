@@ -58,6 +58,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-missing-by-hand", 900.0, missing_by_hand),
         s("view-missing-hidden", 980.0, missing_hidden),
         s("view-check-step-by-step", 860.0, check),
+        s("view-check-step-by-step-public", 860.0, check_public),
         s("view-cant-hear-all-good", 860.0, cant_hear_good),
         s("view-cant-hear-cant-tell", 900.0, cant_hear_cant_tell),
         s("view-cant-hear-muted", 760.0, cant_hear_muted),
@@ -66,6 +67,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-connecting", 640.0, cant_hear_connecting),
         s("view-cant-hear-trying", 640.0, cant_hear_trying),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
+        s("view-cant-hear-public-network", 860.0, cant_hear_public),
         s("view-cant-hear-windows-didnt-switch", 520.0, cant_hear_didnt_switch),
         s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
         s("view-cant-hear-app-elsewhere-playing", 900.0, cant_hear_app_while_playing),
@@ -437,6 +439,20 @@ fn check(ui: &mut Ui, _: &mut Stage) {
     frame(ui, "check", &mut v, &snap("kitchen-playing"));
 }
 
+/// The search check on a network Windows treats as public, as it does a
+/// newly joined one.
+fn check_public(ui: &mut Ui, _: &mut Stage) {
+    let mut v = CheckView::new(port(Names::Usual, |s| {
+        s.discovery.lines.retain(|line| !matches!(line, FindLine::Vpn { .. }));
+        for line in &mut s.discovery.lines {
+            if let FindLine::Profile { private, .. } = line {
+                *private = false;
+            }
+        }
+    }));
+    frame(ui, "check-public", &mut v, &snap("kitchen-playing"));
+}
+
 fn cant_hear(ui: &mut Ui, key: &str, scenario: &str, f: impl FnOnce(&mut State)) {
     let mut v = CantHearView::new(port(Names::Usual, f));
     frame(ui, key, &mut v, &snap(scenario));
@@ -492,6 +508,14 @@ fn not_connected(s: &mut State) {
 fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-not-asking", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
+        s.playback.volume = None;
+    });
+}
+
+fn cant_hear_public(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-public-network", "kitchen-playing", |s| {
+        s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+        s.playback.public_network = Some("HomeNet".into());
         s.playback.volume = None;
     });
 }

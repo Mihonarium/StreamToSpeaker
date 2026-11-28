@@ -404,6 +404,11 @@ pub struct PlaybackCheck {
     /// can't tell whether it plays the speaker's sound, so the check only
     /// says what happened; a device is allowed on the speaker's page.
     pub turned_away: Option<TurnedAway>,
+    /// While the speaker isn't asking for the sound and no device was
+    /// turned away: the network this PC reaches the speaker over, where
+    /// Windows treats it as public. Windows Firewall, which the app
+    /// doesn't read, may keep the speaker from reaching this PC there.
+    pub public_network: Option<String>,
     pub volume: Link<Volume>,
     /// Routes nobody has tried on real hardware.
     pub untested: bool,

@@ -834,6 +834,34 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
 }
 
 #[test]
+fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
+    let not_asking = |network: Option<&str>| {
+        let network = network.map(String::from);
+        scripted(move |s| {
+            s.playback.taking = Some(Err(Taking::NotAsking { two_ways: false }));
+            s.playback.public_network = network;
+            s.playback.volume = None;
+        })
+    };
+    let port = not_asking(Some("HomeNet"));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    // The broken step stays the speaker's, with its way out.
+    assert!(h.has("Kitchen accepted the connection but isn’t asking for the sound.") && h.has("Try Kitchen again"));
+    // Under it, the search check's caution in the same words, where it
+    // bites: the speaker has to reach this PC for the sound.
+    assert!(h.has("Windows treats “HomeNet” as a public network."));
+    assert!(h.shows("On a public network, Windows Firewall may keep speakers from reaching this PC."));
+    h.click("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    assert_eq!(h.acts(), vec![]);
+    // On a private network, or one Windows says nothing of, the step
+    // has nothing to say about the network.
+    let port = not_asking(None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Try Kitchen again") && !h.shows("public network") && !h.has("Open network settings"));
+}
+
+#[test]
 fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
     let away = |device: Option<&str>| {
         let device = device.map(String::from);
