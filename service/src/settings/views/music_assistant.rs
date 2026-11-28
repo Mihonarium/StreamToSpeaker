@@ -1,6 +1,7 @@
 //! Music Assistant's view, from the *›* at the end of its row or from
 //! Settings: whether this PC is offered to it, the three steps that tick
-//! themselves, its code, the name this PC appears as.
+//! themselves (or, once set up, that it isn't connected), its code, the
+//! name this PC appears as.
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ fn state_words(lang: crate::model::text::Lang, v: &MaView) -> String {
     match v.offer {
         None | Some(false) => w!(lang, SetMaStateOff),
         Some(true) if v.paired_with.is_empty() => w!(lang, SetMaStateSettingUp),
+        Some(true) if v.found_by.is_none() => w!(lang, SetMaStateNotConnected),
         Some(true) => w!(lang, SetMaStateReady),
     }
 }
@@ -68,51 +70,64 @@ impl ViewContent for MusicAssistantView {
         }
         thin(ui);
         let pc = v.appears_as.as_str();
-        let found = v.found_by.is_some() || !v.paired_with.is_empty();
+        let connected = v.found_by.is_some();
         let paired = !v.paired_with.is_empty();
         let played = v.played.is_some();
-        let mark = |done: bool, current: bool| {
-            if done {
-                StepMark::Done
-            } else if current {
-                StepMark::Current
-            } else {
-                StepMark::Later
+        let port = self.port.clone();
+        let paired_lines = |ui: &mut Ui| {
+            for server in &v.paired_with {
+                if sentence_links(ui, &w!(lang, SetMaPaired, server = server), &[&w!(lang, SetMaUnpair)]).is_some() {
+                    port.act(Act::Unpair(server.clone()));
+                }
             }
         };
-        let port = self.port.clone();
-        step(ui, 1, mark(found, !found), &w!(lang, SetMaStep1), |ui| match &v.found_by {
-            Some((server, Some(at))) => {
-                sentence(ui, &w!(lang, SetMaFoundAt, server = server, address = at, pc = pc));
-                if Button::standard(&w!(lang, SetOpenMa)).icon(crate::ui::icon::Icon::External).show(ui).clicked() {
-                    port.act(Act::OpenMusicAssistant);
-                }
+        if paired && !connected {
+            // Set up earlier and not connected now. The steps would show a
+            // later one done under an earlier one that isn't, so the view
+            // says what holds in plain lines. A failure to start is said
+            // above and is the reason then.
+            if v.failed.is_none() {
+                sentence(ui, &w!(lang, SetMaNotConnected));
             }
-            Some((server, None)) => sentence(ui, &w!(lang, SetMaFound, server = server, pc = pc)),
-            None if found => sentence(ui, &w!(lang, SetMaFoundBefore, pc = pc)),
-            None => sentence(ui, &w!(lang, SetMaStep1Line, pc = pc)),
-        });
-        step(ui, 2, mark(paired, found && !paired), &w!(lang, SetMaStep2), |ui| {
-            if paired {
-                for server in &v.paired_with {
-                    if sentence_links(ui, &w!(lang, SetMaPaired, server = server), &[&w!(lang, SetMaUnpair)]).is_some() {
-                        self.port.act(Act::Unpair(server.clone()));
+            paired_lines(ui);
+        } else {
+            let mark = |done: bool, current: bool| {
+                if done {
+                    StepMark::Done
+                } else if current {
+                    StepMark::Current
+                } else {
+                    StepMark::Later
+                }
+            };
+            step(ui, 1, mark(connected, !connected), &w!(lang, SetMaStep1), |ui| match &v.found_by {
+                Some((server, Some(at))) => {
+                    sentence(ui, &w!(lang, SetMaFoundAt, server = server, address = at, pc = pc));
+                    if Button::standard(&w!(lang, SetOpenMa)).icon(crate::ui::icon::Icon::External).show(ui).clicked() {
+                        port.act(Act::OpenMusicAssistant);
                     }
                 }
-            } else {
-                sentence(ui, &w!(lang, SetMaStep2Line, pc = pc));
-                if let Some((code, left)) = &v.code {
-                    code_box(ui, lang, &mut self.st, code, *left);
+                Some((server, None)) => sentence(ui, &w!(lang, SetMaFound, server = server, pc = pc)),
+                None => sentence(ui, &w!(lang, SetMaStep1Line, pc = pc)),
+            });
+            step(ui, 2, mark(paired, connected && !paired), &w!(lang, SetMaStep2), |ui| {
+                if paired {
+                    paired_lines(ui);
+                } else {
+                    sentence(ui, &w!(lang, SetMaStep2Line, pc = pc));
+                    if let Some((code, left)) = &v.code {
+                        code_box(ui, lang, &mut self.st, code, *left);
+                    }
                 }
+            });
+            step(ui, 3, mark(played, connected && paired && !played), &w!(lang, SetMaStep3), |ui| match v.played {
+                Some(Some(d)) => sentence(ui, &w!(lang, SetMaPlayedOn, date = &words::date(lang, d))),
+                Some(None) => sentence(ui, &w!(lang, SetMaPlayed)),
+                None => sentence(ui, &w!(lang, SetMaStep3Line, pc = pc)),
+            });
+            if connected && paired && played {
+                sentence(ui, &w!(lang, SetMaAllDone));
             }
-        });
-        step(ui, 3, mark(played, paired && !played), &w!(lang, SetMaStep3), |ui| match v.played {
-            Some(Some(d)) => sentence(ui, &w!(lang, SetMaPlayedOn, date = &words::date(lang, d))),
-            Some(None) => sentence(ui, &w!(lang, SetMaPlayed)),
-            None => sentence(ui, &w!(lang, SetMaStep3Line, pc = pc)),
-        });
-        if found && paired && played {
-            sentence(ui, &w!(lang, SetMaAllDone));
         }
         thin(ui);
         if let Some(n) = field_line(ui, &mut self.st, "appears-as", &w!(lang, SetMaAppearsAs), &v.appears_as) {

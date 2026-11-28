@@ -419,6 +419,8 @@ struct FakeDesktop {
 
 impl Desktop for FakeDesktop {
     fn open_url(&self, url: &str) {
+        // The PC's own desktop opens nothing that this check refuses.
+        assert!(crate::is_openable_url(url), "the app would refuse to open {url}");
         self.opened.lock().unwrap().push(url.into());
     }
     fn open_folder(&self, dir: &std::path::Path) -> std::io::Result<()> {
@@ -491,9 +493,12 @@ fn the_real_app_keeps_general_privacy_about_and_lab() {
     port.act(Act::SwitchBackAfterQuiet(true));
     port.act(Act::NotesByClock(false));
     let g = port.general();
-    assert!(g.shortcuts.unwrap().on && g.language.is_none());
+    // The delay's keyboard shortcuts are off until a person turns them on.
+    assert!(!g.shortcuts.unwrap().on && g.language.is_none());
     assert_eq!(g.play_calls, Some(false));
     assert_eq!(g.what_plays, Some(WhatPlays::Everything));
+    port.act(Act::Shortcuts(true));
+    assert!(port.general().shortcuts.unwrap().on && app.user_config.lock().unwrap().delay_shortcuts);
     port.act(Act::WhatPlays(WhatPlays::OnlySentApps));
     port.act(Act::PlayCalls(true));
     port.act(Act::Shortcuts(false));
@@ -530,6 +535,33 @@ fn the_real_app_keeps_general_privacy_about_and_lab() {
     port.act(Act::LicenceAndSource);
     assert_eq!(desk.opened.lock().unwrap().len(), 2);
     assert!(desk.opened.lock().unwrap().iter().all(|u| crate::is_openable_url(u)));
+}
+
+#[test]
+fn the_check_finds_a_muted_speaker_before_it_reads_the_level() {
+    use super::real::volume_found;
+    assert_eq!(volume_found(32, true), Err(Volume::Muted));
+    assert_eq!(volume_found(0, true), Err(Volume::Muted));
+    assert_eq!(volume_found(0, false), Err(Volume::Zero));
+    assert_eq!(volume_found(32, false), Ok(Volume::Level(32)));
+    assert_eq!(volume_found(250, false), Ok(Volume::Level(100)));
+}
+
+#[test]
+fn every_link_the_app_opens_is_one_it_can_open() {
+    let (_, port, desk) = real();
+    for act in [Act::OpenApiHelp, Act::WhatsNew, Act::UpdateNow, Act::Donate, Act::LicenceAndSource, Act::OpenIssue(String::new())] {
+        let before = desk.opened.lock().unwrap().len();
+        port.act(act.clone());
+        // The test desktop fails on an address the real one would refuse to open.
+        assert_eq!(desk.opened.lock().unwrap().len(), before + 1, "{act:?} opened nothing");
+    }
+    // The API's link leads to a heading that the document has.
+    let opened = desk.opened.lock().unwrap();
+    let (page, place) = opened[0].split_once('#').unwrap();
+    assert!(page.ends_with("/TECHNICAL.md"), "{page}");
+    let heading = include_str!("../../../TECHNICAL.md").lines().filter_map(|l| l.strip_prefix("## ")).find(|h| h.to_lowercase().replace(' ', "-") == place);
+    assert!(heading.is_some(), "TECHNICAL.md has no heading for #{place}");
 }
 
 #[test]

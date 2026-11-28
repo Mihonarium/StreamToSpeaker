@@ -59,10 +59,11 @@ pub mod platform;
 pub mod settings;
 
 /// Whether `url` is something we're willing to hand to the shell: an
-/// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`.
-/// That excludes whitespace, quotes, control characters and shell
-/// metacharacters (`&`, `|`, `^`, `<`, `>`); nothing we open needs a
-/// query string.
+/// absolute http(s) URL made only of letters, digits and `-._~/:%[]@`,
+/// which may end in one `#` and the name of a place on the page, made of
+/// the same characters. That excludes whitespace, quotes, control
+/// characters and shell metacharacters (`&`, `|`, `^`, `<`, `>`); nothing
+/// we open needs a query string.
 pub fn is_openable_url(url: &str) -> bool {
     let rest = if let Some(r) = url.strip_prefix("https://") {
         r
@@ -71,12 +72,9 @@ pub fn is_openable_url(url: &str) -> bool {
     } else {
         return false;
     };
-    !rest.is_empty()
-        && !rest.starts_with('/')
-        && rest.len() < 2048
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~/:%[]@".contains(&b))
+    let plain = |part: &str| part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/:%[]@".contains(&b));
+    let (address, place) = rest.split_once('#').unwrap_or((rest, ""));
+    !address.is_empty() && !address.starts_with('/') && rest.len() < 2048 && plain(address) && plain(place)
 }
 
 /// Open `url` in the default browser via `ShellExecuteW` — no command
@@ -150,7 +148,14 @@ mod url_tests {
         assert!(is_openable_url("https://github.com/Mihonarium/StreamToSpeaker/releases/tag/v0.1.4"));
         assert!(is_openable_url("http://192.168.1.10:5901/"));
         assert!(is_openable_url("http://[fe80::1]:5901/"));
+        // A place on a page.
+        assert!(is_openable_url("https://github.com/Mihonarium/StreamToSpeaker/blob/main/TECHNICAL.md#http-api"));
         for bad in [
+            "https://github.com/x#a#b",
+            "https://github.com/x#a&calc",
+            "https://github.com/x#a\"calc",
+            "https://github.com/x#a calc",
+            "https://#a",
             "https://github.com/x&calc",
             "https://github.com/x|calc",
             "https://github.com/x^&calc",

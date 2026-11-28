@@ -627,9 +627,13 @@ impl SettingsPort for AppSettings {
 
     fn playback_check(&self) -> PlaybackCheck {
         let app = &self.app;
-        let speaker = app.engine_view().and_then(|view| {
+        let view = app.engine_view();
+        let speaker = view.as_ref().and_then(|view| {
             view.scene.situation.place_speaker().map(|id| view.scene.speaker_name(id))
         });
+        // The level and mute the panel shows for the place, so that the
+        // check and the panel can't disagree.
+        let level = view.as_ref().and_then(|view| view.scene.volume.place.as_ref().map(|l| (l.value, l.muted)));
         let mut c = PlaybackCheck {
             speaker: speaker.clone(),
             playing: None,
@@ -676,7 +680,7 @@ impl SettingsPort for AppSettings {
         if broken {
             return c;
         }
-        c.volume = app.current_volume().map(|v| if v == 0 { Err(Volume::Zero) } else { Ok(Volume::Level(v.min(100) as u8)) });
+        c.volume = level.map(|(level, muted)| volume_found(level, muted));
         c
     }
 
@@ -965,6 +969,7 @@ impl SettingsPort for AppSettings {
                 }
             }
             Act::SetVolume(v) => app.set_speaker_volume(v as u32),
+            Act::Unmute => app.set_speaker_muted(false),
             Act::DailyUpdateCheck(on) => app.set_check_for_updates(on),
             Act::CheckNow => app.check_for_updates_now(),
             Act::WhatsNew | Act::UpdateNow => {
@@ -1036,7 +1041,6 @@ impl SettingsPort for AppSettings {
             // Controls the real app's views leave out.
             Act::Language(_)
             | Act::OpenMusicAssistant
-            | Act::Unmute
             | Act::SendToUs
             | Act::OpenNetworkSettings
             | Act::AllowThroughFirewall
@@ -1044,6 +1048,18 @@ impl SettingsPort for AppSettings {
             | Act::CancelInstall
             | Act::CancelPassword(_) => log::debug!("settings: {described} isn't offered by this version"),
         }
+    }
+}
+
+/// The check's last step. Mute comes first: a muted speaker is silent at
+/// any level, and the level is looked at again once it is unmuted.
+pub(crate) fn volume_found(level: u8, muted: bool) -> Result<Volume, Volume> {
+    if muted {
+        Err(Volume::Muted)
+    } else if level == 0 {
+        Err(Volume::Zero)
+    } else {
+        Ok(Volume::Level(level.min(100)))
     }
 }
 

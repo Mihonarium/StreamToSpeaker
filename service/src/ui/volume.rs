@@ -56,8 +56,8 @@ impl<'a> Slider<'a> {
         self
     }
 
-    /// Align the track with thumb travel. A track press seeks immediately,
-    /// while grabbing the thumb preserves the pointer’s offset.
+    /// A track press seeks immediately, while grabbing the thumb preserves
+    /// the pointer’s offset. Positions land on whole pixels.
     pub(crate) fn flyout(mut self) -> Self {
         self.flyout = true;
         self
@@ -73,7 +73,8 @@ impl<'a> Slider<'a> {
         let (lo, hi) = (*self.range.start(), *self.range.end());
         let top = self.max_allowed.unwrap_or(hi).min(hi);
         let snap = |v: f32| ((v / self.step).round() * self.step).clamp(lo, top);
-        // The thumb's centre runs from 10 points in at each end.
+        // The thumb's centre runs from 10 points in at each end, so the thumb
+        // never reaches past the track.
         let (x0, x1) = (track.left() + 10.0, track.right() - 10.0);
         let frac = |v: f32| if hi > lo { (v - lo) / (hi - lo) } else { 0.0 };
         let x_of = |v: f32| x0 + (x1 - x0) * frac(v).clamp(0.0, 1.0);
@@ -128,7 +129,7 @@ impl<'a> Slider<'a> {
         };
         let thumb_x = if self.flyout { p.round_to_pixel(x_of(out.unwrap_or(self.value))) } else { x_of(self.value) };
         let fill = if self.faint { t.c.text_disabled } else { t.c.accent };
-        let (left, right) = if self.flyout { (x0, x1) } else { (track.left(), track.right()) };
+        let (left, right) = (track.left(), track.right());
         p.rect_filled(bar(left, right), 2.0, t.c.track);
         p.rect_filled(bar(left, thumb_x), 2.0, fill);
         if let Some(at) = self.tick {

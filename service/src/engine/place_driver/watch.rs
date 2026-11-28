@@ -145,7 +145,11 @@ impl PlaceDriver {
                     let mut cfg = self.app.user_config.lock().unwrap();
                     let s = cfg.speaker_settings.entry(id.as_str().into()).or_default();
                     s.last_played = Some(seconds);
-                    if let Some(net) = w.connections.iter().find(|c| c.kind != crate::model::situation::ConnKind::Other) {
+                    // Music Assistant's network is recorded when its server
+                    // connects: its output starts with no server connected,
+                    // on whatever network this PC is on.
+                    let net = w.connections.iter().find(|c| c.kind != crate::model::situation::ConnKind::Other);
+                    if let Some(net) = net.filter(|_| !id.is_music_assistant()) {
                         s.network = Some(net.net.clone());
                     }
                     cfg.save();

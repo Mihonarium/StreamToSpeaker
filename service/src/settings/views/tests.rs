@@ -654,6 +654,11 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
     h.click("Unmute");
     assert_eq!(h.asks(), vec![Asked::Command(Command::SetMuted { owner: VolumeOwner::Speaker(crate::model::samples::kitchen()), muted: false })]);
+    // The level sent to Music Assistant is the app's own to set.
+    let port = scripted(|s| s.playback.volume = Some(Err(Volume::Zero)));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("music-assistant-playing"));
+    h.click("Set to 20");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::SetVolume { owner: VolumeOwner::MusicAssistant, level: 20 })]);
     let port = scripted(|s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
@@ -945,7 +950,13 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.paired_with = vec!["x".into()];
             s.ma.played = Some(None);
         },
-        |s| { s.about.updates.state = UpdateState::NotSigned; s.general.shortcuts.as_mut().unwrap().on = false; },
+        |s| {
+            s.about.updates.state = UpdateState::NotSigned;
+            s.general.shortcuts.as_mut().unwrap().on = false;
+            s.ma.found_by = None;
+            s.ma.code = None;
+            s.ma.paired_with = vec!["x".into()];
+        },
         |s| s.about.updates.state = UpdateState::DevBuild,
         |s| {
             s.about.updates.state = UpdateState::UpToDate { at: Seen::On(Date { day: 3, month: 1 }) };
@@ -959,11 +970,15 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.about.updates.installs_here = false;
             s.playback.connected = Some(Err(()));
             s.ma.found_by = Some(("Music Assistant (Home)".into(), Some("192.168.1.10".into())));
+            s.ma.code = Some(("482917".into(), Some(171)));
             s.ma.paired_with.clear();
         },
         |s| {
             s.playback.taking = Some(Ok(Taking::CantTell));
             s.playback.on_short = true;
+            s.ma.code = None;
+            s.ma.paired_with = vec!["x".into()];
+            s.ma.played = Some(Some(Date { day: 12, month: 10 }));
         },
         |s| {
             s.playback.untested = true;

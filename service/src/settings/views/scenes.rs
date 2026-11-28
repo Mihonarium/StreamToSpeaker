@@ -72,6 +72,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-music-assistant-off", 520.0, ma_off),
         s("view-music-assistant-setting-up", 1120.0, ma_setting_up),
         s("view-music-assistant-done", 1100.0, ma_done),
+        s("view-music-assistant-not-connected", 1100.0, ma_not_connected),
         s("view-about", 880.0, about),
         s("view-about-up-to-date", 760.0, about_latest),
         s("view-lab", 1300.0, lab),
@@ -527,7 +528,16 @@ fn ma_done(ui: &mut Ui, _: &mut Stage) {
     ma(ui, "ma-done", |s| {
         s.ma.code = None;
         s.ma.paired_with = vec!["Music Assistant (Home)".into()];
-        s.ma.played = Some(Some(Date { day: 12, month: 10 }));
+        s.ma.played = Some(None);
+    });
+}
+
+/// Paired earlier; Music Assistant is off, or this PC is on another network.
+fn ma_not_connected(ui: &mut Ui, _: &mut Stage) {
+    ma(ui, "ma-not-connected", |s| {
+        s.ma.found_by = None;
+        s.ma.code = None;
+        s.ma.paired_with = vec!["Music Assistant (Home)".into()];
     });
 }
 

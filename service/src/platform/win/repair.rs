@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Context, Result};
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
@@ -35,6 +35,25 @@ fn system_directory() -> io::Result<PathBuf> {
         ));
     }
     Ok(PathBuf::from(OsString::from_wide(&system[..len])))
+}
+
+/// The approved run starts with the environment of the person's own
+/// session, which any of their programs can change, and Windows reads
+/// `%SystemRoot%` and `%windir%` from it when it looks for some of its own
+/// files. Both, and the search path, are set to what Windows itself says,
+/// for this run and the tools it starts.
+fn use_windows_own_folders() -> io::Result<()> {
+    let mut windows = [0u16; 260];
+    // SAFETY: Windows writes at most the supplied number of UTF-16 units into windows.
+    let len = unsafe { GetSystemWindowsDirectoryW(windows.as_mut_ptr(), windows.len() as u32) } as usize;
+    if len == 0 || len >= windows.len() {
+        return Err(io::Error::other("Could not locate the Windows directory"));
+    }
+    let windows = OsString::from_wide(&windows[..len]);
+    std::env::set_var("SystemRoot", &windows);
+    std::env::set_var("windir", &windows);
+    std::env::set_var("PATH", system_directory()?);
+    Ok(())
 }
 
 fn launch(app: &Path, run_id: &str) -> io::Result<OwnedHandle> {
@@ -102,6 +121,7 @@ pub(super) fn run(approved: &mut dyn FnMut()) -> RepairExit {
 pub fn repair_output(run_id: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 
+    if use_windows_own_folders().is_err() { std::process::exit(1); }
     let deadline = Instant::now() + Duration::from_secs(100);
     let watchdog = std::thread::Builder::new().name("repair-deadline".into()).spawn(move || {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));

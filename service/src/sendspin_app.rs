@@ -517,6 +517,17 @@ impl App {
         self.sendspin.source.lock().unwrap().as_ref().map(|s| s.state())
     }
 
+    /// How many times a paired Music Assistant server has connected; zero
+    /// while the input is off.
+    pub fn sendspin_source_arrivals(&self) -> u64 {
+        self.sendspin.source.lock().unwrap().as_ref().map_or(0, |s| s.arrivals())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sendspin_source_state(&self, state: SourceState) {
+        self.sendspin.source.lock().unwrap().as_ref().expect("the input is on").set_state(state);
+    }
+
     /// The port the Music Assistant input listens on, the one it was meant
     /// to (8928, where Music Assistant dials an address it is given), and
     /// why it doesn't listen there; `None` while the input is off.

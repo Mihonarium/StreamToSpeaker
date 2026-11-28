@@ -383,6 +383,8 @@ pub fn named(name: &str) -> Scene {
                 .push(Standing::OnlySomeApps { none_playing: true });
         }
         "kitchen-muted" => s.volume.place.as_mut().unwrap().muted = true,
+        "kitchen-full-volume" => s.volume.place = Some(Level::at(100)),
+        "kitchen-volume-zero" => s.volume.place = Some(Level::at(0)),
         "kitchen-volume-limit" => {
             s.volume.place = Some(Level {
                 value: 60,
@@ -464,7 +466,9 @@ pub fn named(name: &str) -> Scene {
         }
         "music-assistant-playing" => {
             let ma = SpeakerId::music_assistant();
-            add_speaker(&mut s, seen(ma.clone(), "Music Assistant"));
+            // As the app lists it: Music Assistant sets its own delay.
+            let row = SpeakerSeen { kind: SpeakerKind::Sendspin, ways: Vec::new(), ..seen(ma.clone(), "Music Assistant") };
+            add_speaker(&mut s, row);
             on_speaker(&mut s, ma);
         }
         "twins" => {
@@ -582,6 +586,8 @@ macro_rules! with_sample_names {
             "kitchen-except-an-app",
             "kitchen-only-chosen-apps",
             "kitchen-muted",
+            "kitchen-full-volume",
+            "kitchen-volume-zero",
             "kitchen-volume-limit",
             "question",
             "repair-needed",

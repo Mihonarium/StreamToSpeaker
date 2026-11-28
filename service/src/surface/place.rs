@@ -143,7 +143,7 @@ fn volume(
         muted: !v.muted,
     });
     out.record(ui, &resp, &v.mute_spoken, enabled, cmd.as_ref());
-    let track = line(origin, TEXT - MEDIUM, END + MEDIUM, cy, BODY_LINE);
+    let track = line(origin, TEXT, END, cy, BODY_LINE);
     state.pending = state.pending.take().filter(|(id, value)| {
         enabled
             && v.owner.as_ref() == Some(id)

@@ -430,8 +430,10 @@ pub fn example() -> State {
             offer: Some(true),
             failed: None,
             appears_as: "DESKTOP-7Q".into(),
-            found_by: Some(("Music Assistant (Home)".into(), Some("homeassistant.local".into()))),
-            code: Some(("482917".into(), Some(171))),
+            // As the app is told: Music Assistant's name, without its
+            // address or how long its code stays.
+            found_by: Some(("Music Assistant (Home)".into(), None)),
+            code: Some(("482917".into(), None)),
             paired_with: vec![],
             played: None,
             paused: false,

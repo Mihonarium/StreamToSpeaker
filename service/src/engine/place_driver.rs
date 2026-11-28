@@ -94,6 +94,9 @@ pub(crate) struct PlaceDriver {
     played: Option<SpeakerId>,
     level: Option<(SpeakerId, u8, u64)>,
     ma_before_mute: Option<u8>,
+    /// Which arrival of Music Assistant's server was connected when its
+    /// network was last looked at; `None` while none was.
+    ma_connected: Option<u64>,
     pass: Option<pass::Worker>,
     /// A `--player` request waits while a change of Windows' output is told
     /// apart: a person who is choosing an output goes first.
@@ -196,6 +199,7 @@ impl PlaceDriver {
             played: None,
             level: None,
             ma_before_mute: None,
+            ma_connected: None,
             pass,
             held: VecDeque::new(),
             held_answers: Vec::new(),

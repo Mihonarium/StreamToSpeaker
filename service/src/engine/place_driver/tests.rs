@@ -20,6 +20,12 @@ const DEN: &str = "uuid:fake-den";
 fn id() -> SpeakerId {
     SpeakerId::new(DEN)
 }
+/// Settings of a person who turned the delay's keyboard shortcuts on.
+fn with_shortcuts() -> UserConfig {
+    let mut cfg = UserConfig::in_memory();
+    cfg.delay_shortcuts = true;
+    cfg
+}
 fn output(s: &str) -> PcOutputId {
     PcOutputId::new(s)
 }
@@ -942,7 +948,7 @@ fn recording_releases_delay_keys_until_cancelled_or_saved() {
     use crate::platform::{DelayKeys, DelayPress};
     use crate::settings::{real::AppSettings, port::{Act, SettingsPort}};
     let fake = FakeRenderer::start(answer);
-    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    let mut r = Rig::new(&fake, with_shortcuts());
     r.playing();
     let settings = AppSettings::new(r.app.clone());
     let old = DelayKeys::default();
@@ -984,7 +990,7 @@ fn keys_after_hiding_settings(close: bool) {
     use crate::ui::{preview, theme::Mode};
 
     let fake = FakeRenderer::start(answer);
-    let mut cfg = UserConfig::in_memory();
+    let mut cfg = with_shortcuts();
     cfg.onboarding_dismissed = true;
     let mut r = Rig::new(&fake, cfg);
     r.playing();
@@ -1039,7 +1045,7 @@ fn closing_the_window_restores_the_delay_keys() {
 #[test]
 fn delay_keys_do_nothing_while_the_speaker_is_paused() {
     let fake = FakeRenderer::start(answer);
-    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    let mut r = Rig::new(&fake, with_shortcuts());
     r.pick();
     r.settle();
     r.windows.app_plays("Game", OURS, Some(0.5));
@@ -1077,6 +1083,13 @@ fn delay_keys_act_on_the_playing_speaker_and_release_their_registrations() {
         assert!(r.windows.press_keys(chord));
         r.driver.input(r.rx.recv_timeout(WAIT).unwrap());
     };
+    // The app takes no keys until a person turns the shortcuts on.
+    for chord in [&remove, &add, &large_remove, &large_add] {
+        assert!(!r.windows.press_keys(chord));
+    }
+    assert!(!settings.general().shortcuts.unwrap().on);
+    settings.act(Act::Shortcuts(true));
+    r.driver.look();
     press(&mut r, &add);
     assert_eq!(r.app.delay_status_of(DEN).change_ms, 0);
     r.pick();

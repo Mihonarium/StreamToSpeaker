@@ -660,6 +660,12 @@ fn about(scene: &Scene, list: &ListPart) -> About {
         return About::Note(note);
     }
     if let Some(id) = sit.place_speaker() {
+        if id.is_music_assistant() {
+            // Music Assistant sets its speakers' delay, so the part has
+            // no delay controls; it says where they are and what the
+            // volume slider sets.
+            return About::Line { text: t!(lang, MaPlaceLine), link: None };
+        }
         return delay_about(scene, id);
     }
     if list

@@ -40,7 +40,7 @@ fn short_and_cli_status_use_the_visible_panel_words() {
         ("office-playing", "Office: Playing", "Office: Playing · Office is about 150 ms behind the picture. · volume 32"),
         ("pc-plain", "This PC · Speakers: Playing", "This PC · Speakers: Playing · volume 40"),
         ("pc-headphones-connected", "This PC · Headphones: Playing", "This PC · Headphones: Playing · volume 40"),
-        ("music-assistant-playing", "Music Assistant: Playing", "Music Assistant: Playing · Music Assistant is about 150 ms behind the picture. · volume 32"),
+        ("music-assistant-playing", "Music Assistant: Playing", "Music Assistant: Playing · volume 32"),
     ] {
         let v = view(samples::named(sample), None, false, 1);
         assert_eq!(v.status, status, "{sample}");

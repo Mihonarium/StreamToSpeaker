@@ -49,7 +49,10 @@ pub struct UserConfig {
     /// The endpoint to give calls back to after routing them to a speaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls_back: Option<crate::model::state::PcOutputId>,
-    #[serde(default = "default_true")]
+    /// Keys that change the delay from any program. Off until a person
+    /// turns them on: a global shortcut takes its key combination from
+    /// every other program.
+    #[serde(default)]
     pub delay_shortcuts: bool,
     #[serde(default)]
     pub delay_keys: crate::platform::DelayKeys,
@@ -2205,7 +2208,7 @@ mod tests {
         c.only_some_apps = true;
         c.play_calls = true;
         c.calls_back = Some(crate::model::state::PcOutputId::new("call-headset"));
-        c.delay_shortcuts = false;
+        c.delay_shortcuts = true;
         c.delay_keys.0 = ["F8", "F9"].map(|key| vec!["Alt".into(), "Ctrl".into(), key.into()]);
         c.pc_outputs_open = true;
         c.window_height = Some(512.0);

@@ -181,6 +181,7 @@ fn enabled_music_assistant_has_its_own_row() {
     r.settle();
     assert!(r.driver.scene().situation.speaker(&ma).unwrap().can_chime);
     r.windows.app_plays("Music", OURS, Some(0.5));
+    r.app.user_config.lock().unwrap().delay_shortcuts = true;
     r.driver.look();
     assert_eq!(r.driver.situation().doing, Doing::Playing);
     let keys = crate::platform::DelayKeys::default();
@@ -198,6 +199,99 @@ fn enabled_music_assistant_has_its_own_row() {
         .situation
         .speaker(&SpeakerId::music_assistant())
         .is_some());
+}
+
+#[test]
+fn music_assistant_follows_the_network_it_connected_on() {
+    use crate::sendspin::source::SourceState;
+    let mut r = Rig::on(App::for_tests());
+    r.app.set_sendspin_source_enabled(true).unwrap();
+    let ma = SpeakerId::music_assistant();
+    let listed = |r: &mut Rig| r.driver.scene().speakers.iter().any(|s| s.id.is_music_assistant());
+    let network = |r: &Rig| {
+        let cfg = r.app.user_config.lock().unwrap();
+        cfg.speaker_settings.get(crate::sendspin_app::MA_OUTPUT_ID).and_then(|s| s.network.clone())
+    };
+    let join = |r: &mut Rig, net: &str| {
+        r.windows.connect_to(vec![crate::platform::NetConnection { id: net.into(), name: None, kind: ConnKind::WiFi }]);
+        r.driver.input(PlaceInput::System(SystemEvent::NetworkChanged));
+        r.driver.look();
+    };
+    let connected = |r: &mut Rig, on: bool| {
+        r.app.set_sendspin_source_state(if on {
+            SourceState::Connected { server: "Server".into(), streaming: false }
+        } else {
+            SourceState::Waiting
+        });
+        r.driver.look();
+    };
+
+    // Before it has ever connected, its row is there on any network.
+    join(&mut r, "cafe");
+    assert!(listed(&mut r));
+    assert_eq!(network(&r), None);
+
+    join(&mut r, HOME_NET);
+    connected(&mut r, true);
+    assert_eq!(network(&r), Some(NetId(HOME_NET.into())));
+
+    // This PC moves and the connection hasn't ended yet: that says nothing
+    // about the new network.
+    join(&mut r, "cafe");
+    assert!(listed(&mut r));
+    assert_eq!(network(&r), Some(NetId(HOME_NET.into())));
+
+    // The connection ends. Music Assistant isn't a choice here.
+    connected(&mut r, false);
+    assert!(!listed(&mut r));
+
+    // At home it is one that isn't found.
+    join(&mut r, HOME_NET);
+    r.advance(place::numbers::AFTER_WAKE_MS + 1);
+    assert_eq!(r.driver.scene().situation.speaker(&ma).unwrap().state, RowState::NotFound);
+
+    // Picked at the cafe, it keeps its row there: it is the place, and
+    // after that the speaker the app's device in Windows is named after.
+    // That doesn't make the cafe its network.
+    join(&mut r, "cafe");
+    assert!(!listed(&mut r));
+    r.send(Command::Switch { place: Place::MusicAssistant, way: None });
+    r.settle();
+    assert!(listed(&mut r));
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    assert!(listed(&mut r));
+    assert_eq!(network(&r), Some(NetId(HOME_NET.into())));
+
+    // A Music Assistant that connects at the cafe belongs there from then on.
+    connected(&mut r, true);
+    assert_eq!(network(&r), Some(NetId("cafe".into())));
+
+    // The same server connecting again before its earlier connection has
+    // ended arrives on the network this PC is on by then.
+    join(&mut r, HOME_NET);
+    assert_eq!(network(&r), Some(NetId("cafe".into())));
+    connected(&mut r, true);
+    assert_eq!(network(&r), Some(NetId(HOME_NET.into())));
+    connected(&mut r, false);
+    assert!(listed(&mut r));
+    r.app.set_sendspin_source_enabled(false).unwrap();
+}
+
+#[test]
+fn music_assistant_picked_before_a_server_connects_has_no_network() {
+    let mut r = Rig::on(App::for_tests());
+    r.app.set_sendspin_source_enabled(true).unwrap();
+    r.send(Command::Switch { place: Place::MusicAssistant, way: None });
+    r.settle();
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    let network = {
+        let cfg = r.app.user_config.lock().unwrap();
+        cfg.speaker_settings.get(crate::sendspin_app::MA_OUTPUT_ID).and_then(|s| s.network.clone())
+    };
+    assert_eq!(network, None);
+    r.app.set_sendspin_source_enabled(false).unwrap();
 }
 
 #[test]

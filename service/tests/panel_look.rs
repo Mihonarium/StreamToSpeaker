@@ -765,7 +765,7 @@ fn volume_tracks_the_drag_and_obeys_owner_mute_and_limit() {
                     assert_eq!(Some(&owner), v.owner.as_ref());
                     assert!(level <= v.limit.unwrap_or(100));
                     let thumb_x =
-                        ((46.0 + 288.0 * f32::from(level) / 100.0) * scale).round() / scale;
+                        ((56.0 + 268.0 * f32::from(level) / 100.0) * scale).round() / scale;
                     assert!(
                         drag.circles.contains(&pos2(thumb_x, y)),
                         "{name}: thumb still behind the pointer"
@@ -1076,6 +1076,35 @@ fn focus_place_and_scroll_the_keyboard_row_into_view() {
 }
 
 #[test]
+fn the_thumb_stays_clear_of_the_number_and_the_mute_button() {
+    for scale in SCALES {
+        for (name, level) in [("kitchen-full-volume", "100"), ("kitchen-volume-zero", "0")] {
+            let mut h = named(name, scale);
+            let f = h.settle();
+            let v = h.view.place.volume.clone().unwrap();
+            let track = get(&f, &v.spoken).rect;
+            let y = track.center().y;
+            let thumb = f.circles.iter().find(|c| c.y == y).unwrap();
+            // The thumb is 21 points across with its shadow.
+            let (left, right) = (thumb.x - 10.5, thumb.x + 10.5);
+            let number = f
+                .texts
+                .iter()
+                .find(|t| t.words == level && t.rect.y_range().contains(y))
+                .unwrap();
+            let mute = get(&f, &v.mute_spoken).rect;
+            assert!(
+                right + 6.0 <= number.rect.left(),
+                "{name} at {scale}: the thumb ends at {right}, the number starts at {}",
+                number.rect.left()
+            );
+            assert!(left - 8.0 >= mute.center().x + 9.0, "{name} at {scale}");
+            assert!(left >= track.left() - 0.5 && right <= track.right() + 0.5, "{name} at {scale}");
+        }
+    }
+}
+
+#[test]
 fn track_press_thumb_grab_and_pending_readout() {
     for scale in SCALES {
         let mut h = named("kitchen-playing", scale);
@@ -1084,7 +1113,7 @@ fn track_press_thumb_grab_and_pending_readout() {
         let track = get(&f, &v.spoken).rect;
         let at = |value: u8| {
             pos2(
-                ((46.0 + 2.88 * f32::from(value)) * scale).round() / scale,
+                ((56.0 + 2.68 * f32::from(value)) * scale).round() / scale,
                 track.center().y,
             )
         };
@@ -1114,7 +1143,7 @@ fn track_press_thumb_grab_and_pending_readout() {
         let grab = p + vec2(3.0, 0.0);
         h.frame(vec![Event::PointerMoved(grab)]);
         assert!(h.frame(vec![press(grab, true)]).out.commands.is_empty());
-        for (delta, level) in [(20.0, 77), (40.0, 84)] {
+        for (delta, level) in [(16.0, 76), (40.0, 85)] {
             let f = h.frame(vec![Event::PointerMoved(grab + vec2(delta, 0.0))]);
             assert_eq!(f.out.commands, [cmd(level)]);
             check_number(&f, level);
@@ -1122,13 +1151,13 @@ fn track_press_thumb_grab_and_pending_readout() {
         }
         let f = h.frame(vec![press(grab + vec2(40.0, 0.0), false)]);
         assert!(f.out.commands.is_empty());
-        check_number(&f, 84);
-        for value in [70, 84, 28] {
+        check_number(&f, 85);
+        for value in [70, 85, 28] {
             let v = h.view.place.volume.as_mut().unwrap();
             v.level = value;
             v.number = value.to_string();
             let f = h.frame(vec![]);
-            check_number(&f, if value == 70 { 84 } else { value });
+            check_number(&f, if value == 70 { 85 } else { value });
         }
         for (dimmed, owner) in [(false, None), (true, v.owner.clone())] {
             let v = h.view.place.volume.as_mut().unwrap();

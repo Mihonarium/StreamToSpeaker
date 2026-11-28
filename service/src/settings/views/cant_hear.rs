@@ -36,6 +36,16 @@ impl CantHearView {
     }
 }
 
+/// Whose level the place's is: a speaker's own, or the level this PC sends
+/// to Music Assistant.
+fn volume_owner(id: &SpeakerId) -> VolumeOwner {
+    if id.is_music_assistant() {
+        VolumeOwner::MusicAssistant
+    } else {
+        VolumeOwner::Speaker(id.clone())
+    }
+}
+
 impl ViewContent for CantHearView {
     fn bar(&self, _snap: &Snapshot) -> ViewBar {
         ViewBar { title: w!(self.port.lang(), CantHear), ..Default::default() }
@@ -184,7 +194,7 @@ impl ViewContent for CantHearView {
                     check_line(ui, Found::Bad, &w!(lang, SetCheckMuted, speaker = &speaker), None, |ui| {
                         if Button::standard(&w!(lang, Unmute)).show(ui).clicked() {
                             match &id {
-                                Some(id) => send(ask, Command::SetMuted { owner: VolumeOwner::Speaker(id.clone()), muted: false }),
+                                Some(id) => send(ask, Command::SetMuted { owner: volume_owner(id), muted: false }),
                                 None => self.port.act(Act::Unmute),
                             }
                         }
@@ -195,7 +205,7 @@ impl ViewContent for CantHearView {
                     check_line(ui, Found::Bad, &w!(lang, SetCheckZero, speaker = &speaker), None, |ui| {
                         if Button::standard(&w!(lang, SetSetTo, level = 20u8)).show(ui).clicked() {
                             match &id {
-                                Some(id) => send(ask, Command::SetVolume { owner: VolumeOwner::Speaker(id.clone()), level: 20 }),
+                                Some(id) => send(ask, Command::SetVolume { owner: volume_owner(id), level: 20 }),
                                 None => self.port.act(Act::SetVolume(20)),
                             }
                         }

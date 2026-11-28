@@ -48,6 +48,17 @@ const SIGNAL_THRESHOLD: i16 = 32;
 const SIGNAL_ABSENT_AFTER: Duration = Duration::from_secs(8);
 /// Dynamic pairing code length we accept/offer.
 const MIN_CODE_DIGITS: u32 = 6;
+/// How often the connection looks for a message from the server.
+const POLL: Duration = Duration::from_millis(200);
+/// Polls without a word from a server that was asked for its time, after
+/// which it counts as gone: ten seconds. A server answers a time request
+/// at once and one goes out at least every three seconds. Without this a
+/// server that vanished (this PC moved to another network, the server lost
+/// power) stays "connected" for as long as Windows keeps the connection.
+/// Polls are counted, not time: a PC that slept didn't wait for anything.
+/// Only a server that has answered a time request on this connection is
+/// held to it: one that never answers them isn't judged by its silence.
+const SILENT_POLLS: u32 = if cfg!(test) { 15 } else { 50 };
 /// Wrong pairing codes (across connections and restarts) after which
 /// code pairing is paused until the user allows it again.
 pub const PAIRING_FAILURE_LIMIT: u32 = 10;
@@ -114,6 +125,8 @@ struct Shared {
     store: Arc<dyn SendspinStore>,
     stop: AtomicBool,
     next_conn: AtomicU64,
+    /// How many times a paired server has connected.
+    arrivals: AtomicU64,
     /// Open connections on the listener.
     slots: Arc<ConnectionSlots>,
     state: Mutex<SourceState>,
@@ -240,6 +253,7 @@ impl SourceService {
             store,
             stop: AtomicBool::new(false),
             next_conn: AtomicU64::new(1),
+            arrivals: AtomicU64::new(0),
             slots: Arc::new(ConnectionSlots::default()),
             state: Mutex::new(SourceState::Waiting),
             code: Mutex::new(None),
@@ -287,6 +301,22 @@ impl SourceService {
 
     pub fn state(&self) -> SourceState {
         self.shared.state.lock().unwrap().clone()
+    }
+
+    /// How many times a paired server has connected. A new number while
+    /// the state stays connected says the server connected again.
+    pub fn arrivals(&self) -> u64 {
+        self.shared.arrivals.load(Ordering::SeqCst)
+    }
+
+    /// Tests that need no server say what the input's state is. Saying it
+    /// is connected counts as a server connecting.
+    #[cfg(test)]
+    pub(crate) fn set_state(&self, state: SourceState) {
+        if matches!(state, SourceState::Connected { .. }) {
+            self.shared.arrivals.fetch_add(1, Ordering::SeqCst);
+        }
+        *self.shared.state.lock().unwrap() = state;
     }
 
     /// The 6-digit code to show while a server is pairing with us.
@@ -605,6 +635,8 @@ struct Conn {
     alive: AtomicBool,
     /// Suppress time-sync sends (pairing exchange in progress).
     quiet: AtomicBool,
+    /// A time request went out and nothing has come from the server since.
+    asked: AtomicBool,
     dialect: Dialect,
     /// Source role active on this connection.
     source_active: AtomicBool,
@@ -727,6 +759,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
         filter: Mutex::new(TimeFilter::default()),
         alive: AtomicBool::new(true),
         quiet: AtomicBool::new(false),
+        asked: AtomicBool::new(false),
         dialect,
         source_active: AtomicBool::new(false),
         state_sent: AtomicBool::new(false),
@@ -748,15 +781,30 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
     let mut pairing_index: u32 = 0;
     let mut helpers_started = false;
     let mut start_pending = false;
+    let mut silent = 0;
+    // Whether the server has answered a time request on this connection.
+    let mut answers = false;
     loop {
         if sh.stop.load(Ordering::SeqCst) {
             let _ = writer.send_json(&proto::client_goodbye("shutdown"));
             writer.close();
             return Ok(());
         }
-        let ev = match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(ev) => ev,
-            Err(RecvTimeoutError::Timeout) => continue,
+        let ev = match events.recv_timeout(POLL) {
+            Ok(ev) => {
+                silent = 0;
+                conn.asked.store(false, Ordering::SeqCst);
+                ev
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                silent = if answers && conn.asked.load(Ordering::SeqCst) { silent + 1 } else { 0 };
+                if silent >= SILENT_POLLS {
+                    info!("Sendspin source: {} stopped answering; closing the connection", server_name);
+                    writer.close();
+                    return Ok(());
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
         match ev {
@@ -854,6 +902,7 @@ fn run_connection(sh: &Arc<Shared>, conn_id: u64, r: super::ws::WsReader, w: Arc
                     }
                 }
                 "server/time" => {
+                    answers = true;
                     let p = payload(&value);
                     let (Some(t1), Some(t2), Some(t3)) = (
                         p.get("client_transmitted").and_then(Value::as_i64),
@@ -1070,6 +1119,7 @@ fn admit(sh: &Shared, conn_id: u64, act: &Activation, category: PskCategory, ser
             cur.writer.close();
         }
     }
+    let arrived = category == PskCategory::LongTerm && adm.as_ref().map(|a| a.conn_id) != Some(conn_id);
     *adm = Some(Admitted {
         conn_id,
         rank: new_rank,
@@ -1079,6 +1129,9 @@ fn admit(sh: &Shared, conn_id: u64, act: &Activation, category: PskCategory, ser
         writer: writer.clone(),
         peer,
     });
+    if arrived {
+        sh.arrivals.fetch_add(1, Ordering::SeqCst);
+    }
     true
 }
 
@@ -1207,8 +1260,17 @@ fn run_pairing(
 fn spawn_time_sync(conn: Arc<Conn>) {
     let _ = std::thread::Builder::new().name("sendspin-source-time".into()).spawn(move || {
         while conn.alive.load(Ordering::SeqCst) {
-            if !conn.quiet.load(Ordering::SeqCst) && conn.writer.send_json(&proto::client_time(now_us())).is_err() {
-                return;
+            // Nothing is sent, so nothing is owed, during a pairing exchange
+            // or a change of keys.
+            if !conn.quiet.load(Ordering::SeqCst) && !conn.writer.is_rekeying() {
+                // Marked before the request goes out, so that its answer
+                // can't be counted before the request is.
+                conn.asked.store(true, Ordering::SeqCst);
+                if conn.writer.send_json(&proto::client_time(now_us())).is_err() {
+                    // A connection that can't carry a message is over.
+                    conn.writer.close();
+                    return;
+                }
             }
             let wait = conn.filter.lock().unwrap().next_interval_ms();
             let until = Instant::now() + Duration::from_millis(wait);
@@ -1745,6 +1807,7 @@ mod tests {
             store: Arc::new(super::super::MemoryStore::default()),
             stop: AtomicBool::new(false),
             next_conn: AtomicU64::new(1),
+            arrivals: AtomicU64::new(0),
             slots: Arc::new(ConnectionSlots::default()),
             state: Mutex::new(SourceState::Waiting),
             code: Mutex::new(None),
@@ -1788,6 +1851,152 @@ mod tests {
         assert!(sh.slots.holds(2));
         drop((held, ninth, tenth));
         assert!(holders(&sh.slots).is_empty());
+    }
+
+    /// A paired Music Assistant on a loopback connection. It greets the
+    /// source, activates the source role and answers the time requests it
+    /// gets while `answering` is set. It keeps its end of the connection
+    /// open until `done`, so only the source can end the connection.
+    fn paired_server(
+        port: u16,
+        server_key: [u8; 32],
+        psk: [u8; 32],
+        answering: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        use super::super::channel::{envelope, Incoming};
+        use super::super::handshake::{read_first_frame, server_handshake, FirstFrame};
+        use serde_json::json;
+        std::thread::spawn(move || {
+            let wait = Duration::from_secs(5);
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let (mut r, w) = super::super::ws::connect(addr, "127.0.0.1", mdns::DEFAULT_PATH, wait).unwrap();
+            let FirstFrame::Noise { raw, client_id, suite } = read_first_frame(&mut r, &w, wait).unwrap() else {
+                panic!("the source starts with the Noise handshake")
+            };
+            let key = ResolvedPsk::new(psk, PskCategory::LongTerm);
+            let mut hs = server_handshake(r, w, &raw, &client_id, suite, &server_key, key, wait).unwrap();
+            hs.writer.send_json(&envelope("server/hello", json!({ "name": "Test server" }))).unwrap();
+            while let Ok(Incoming::Json { value, .. }) = hs.reader.recv() {
+                let reply = match msg_type(&value) {
+                    "client/hello" => {
+                        envelope("server/activate", json!({ "activities": ["playback"], "active_roles": ["source@v1"] }))
+                    }
+                    "client/time" if answering.load(Ordering::SeqCst) => envelope(
+                        "server/time",
+                        json!({
+                            "client_transmitted": payload(&value)["client_transmitted"],
+                            "server_received": now_us(),
+                            "server_transmitted": now_us(),
+                        }),
+                    ),
+                    _ => continue,
+                };
+                if hs.writer.send_json(&reply).is_err() {
+                    break;
+                }
+            }
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    }
+
+    fn wait_for(what: &str, limit: Duration, mut ok: impl FnMut() -> bool) {
+        let until = Instant::now() + limit;
+        while !ok() {
+            assert!(Instant::now() < until, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A source with a paired stand-in server connected to it.
+    struct Paired {
+        svc: SourceService,
+        server_key: [u8; 32],
+        psk: [u8; 32],
+        answering: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+        servers: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Paired {
+        /// `answering`: whether the server answers time requests.
+        fn new(answering: bool) -> Self {
+            let server_key = super::super::noise::generate_private_key();
+            let psk = [0x42; 32];
+            let store = super::super::MemoryStore::default();
+            store.0.lock().unwrap().server_pairings.push(ServerPairing {
+                server_id: b64url(&x25519_public(&server_key)),
+                psk: b64url(&psk),
+                server_name: None,
+                last_used_unix: 0,
+            });
+            let opts = SourceOptions {
+                name: "PC".into(),
+                port: free_port(),
+                software_version: "test".into(),
+                advertise: false,
+                output_selected: Arc::new(AtomicUsize::new(0)),
+                level: Arc::new(std::sync::atomic::AtomicU8::new(100)),
+            };
+            let svc = SourceService::start(opts, StreamHub::new(), Arc::new(store)).unwrap();
+            let (answering, done) = (Arc::new(AtomicBool::new(answering)), Arc::new(AtomicBool::new(false)));
+            let mut p = Paired { svc, server_key, psk, answering, done, servers: Vec::new() };
+            p.connect();
+            wait_for("the server connects", Duration::from_secs(10), || p.connected());
+            p
+        }
+
+        /// The server connects (again).
+        fn connect(&mut self) {
+            self.servers.push(paired_server(self.svc.port(), self.server_key, self.psk, self.answering.clone(), self.done.clone()));
+        }
+
+        fn connected(&self) -> bool {
+            matches!(self.svc.state(), SourceState::Connected { .. })
+        }
+
+        fn finish(self) {
+            self.done.store(true, Ordering::SeqCst);
+            self.svc.stop();
+            for server in self.servers {
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_is_no_longer_connected() {
+        let p = Paired::new(true);
+        // A server that answers stays connected for longer than the silence
+        // the source puts up with.
+        std::thread::sleep(POLL * (SILENT_POLLS + 4));
+        assert!(p.connected(), "{:?}", p.svc.state());
+
+        // It goes quiet with the connection still open: the source ends it.
+        p.answering.store(false, Ordering::SeqCst);
+        wait_for("the silent server is given up", Duration::from_secs(20), || p.svc.state() == SourceState::Waiting);
+        p.finish();
+    }
+
+    #[test]
+    fn a_server_that_never_answers_a_time_request_keeps_its_connection() {
+        let p = Paired::new(false);
+        std::thread::sleep(POLL * (SILENT_POLLS + 4));
+        assert!(p.connected(), "{:?}", p.svc.state());
+        p.finish();
+    }
+
+    #[test]
+    fn a_paired_server_connecting_again_is_a_new_arrival() {
+        let mut p = Paired::new(true);
+        assert_eq!(p.svc.arrivals(), 1);
+        // The earlier connection is still open when the next one comes.
+        p.connect();
+        wait_for("the second connection is admitted", Duration::from_secs(10), || p.svc.arrivals() == 2);
+        assert!(p.connected(), "{:?}", p.svc.state());
+        p.finish();
     }
 
     #[test]

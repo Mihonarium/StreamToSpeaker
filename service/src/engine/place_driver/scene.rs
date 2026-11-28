@@ -142,7 +142,11 @@ impl PlaceDriver {
                     .connections
                     .iter()
                     .any(|c| Some(&c.net) == row.network.as_ref());
-                if !keep && (saved.hidden || (!ma && !on_network)) {
+                // Music Assistant has a row before it has ever connected,
+                // where its setup can say what is missing. Once it has, it
+                // follows its network as a speaker does.
+                let elsewhere = if ma { !row.found && row.network.is_some() && !on_network } else { !on_network };
+                if !keep && (saved.hidden || elsewhere) {
                     return None;
                 }
                 let name = if ma {

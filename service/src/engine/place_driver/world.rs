@@ -185,15 +185,25 @@ impl PlaceDriver {
             self.bound_ids = None;
         }
         let bound_speaker = bound.as_deref().map(|id| self.speaker_of(id));
+        let net = connections.iter().find(|c| c.kind != ConnKind::Other).map(|c| &c.net);
+        // Music Assistant's network is the one this PC was on when its
+        // server connected, the same server connecting again included. A
+        // connection can outlast a change of network by some seconds, so
+        // being connected doesn't say it is on this network.
+        let ma_now = ma_found.then(|| app.sendspin_source_arrivals());
+        let ma_arrived = remember_network && ma_found && self.ma_connected != ma_now;
+        if remember_network && (net.is_some() || !ma_found) {
+            self.ma_connected = ma_now;
+        }
         let settings = {
             let mut cfg = app.user_config.lock().unwrap();
-            let net = connections.iter().find(|c| c.kind != ConnKind::Other).map(|c| &c.net);
             let mut changed = false;
             for (s, ids) in speakers.iter_mut().zip(&self.ids) {
                 let key = s.id.as_str();
                 // A discovery announcement alone doesn't make this a previously used speaker.
                 let used = cfg.speaker_settings.contains_key(key) || cfg.last_speaker_id.as_deref() == Some(key);
-                if let Some(net) = net.filter(|_| remember_network && s.found && used) {
+                let here = if s.id.is_music_assistant() { ma_arrived } else { remember_network && s.found && used };
+                if let Some(net) = net.filter(|_| here) {
                     let entry = cfg.speaker_settings.entry(key.into()).or_default();
                     if entry.network.as_ref() != Some(net) {
                         entry.network = Some(net.clone());
