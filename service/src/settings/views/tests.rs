@@ -878,7 +878,7 @@ fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
     // matters here: the speaker has to reach this PC for the sound.
     assert!(h.has("Windows treats “HomeNet” as a public network."));
     assert!(h.shows("Kitchen fetches the sound from this PC, and on a public network Windows Firewall may stop it."));
-    assert!(h.shows("choose Private in its properties in Windows’ network settings, then try Kitchen again."));
+    assert!(h.shows("open its properties in Windows’ network settings and choose Private, then try Kitchen again."));
     h.click("Open network settings");
     assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
     assert_eq!(h.acts(), vec![]);
@@ -899,31 +899,38 @@ fn cant_hear_says_when_an_airplay_speaker_hasnt_reached_this_pc() {
             s.playback.public_network = network;
         })
     };
-    // On a network Windows treats as public: what the search check says
-    // of the network, why it matters here, and the way to Windows'
-    // settings. The page doesn't go on to say that all looks right.
+    // On a network Windows treats as public: the step says what is wrong,
+    // then what the search check says of the network with the way to
+    // Windows' settings, and only then offers to try again. The page says
+    // neither that it can't tell nor that all looks right.
     let port = cant_tell(true, Some("HomeNet"));
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("This PC can’t tell whether Kitchen is playing.") && h.has("Try Kitchen again"));
+    assert!(h.has("Kitchen hasn’t connected back to this PC.") && h.has("Try Kitchen again"));
+    assert!(h.shows("An AirPlay speaker connects back to the PC it plays from"));
     assert!(h.has("Windows treats “HomeNet” as a public network."));
-    assert!(h.shows("Kitchen hasn’t reached this PC since it was connected, which AirPlay speakers usually need to do before they play."));
-    assert!(h.shows("On a public network, Windows Firewall may be stopping it.") && h.shows("then try Kitchen again."));
-    assert!(!h.shows("Everything this PC can check looks right."));
+    assert!(h.shows("On a public network, Windows Firewall may be stopping Kitchen.") && h.shows("then try Kitchen again."));
+    assert!(!h.has("This PC can’t tell whether Kitchen is playing.") && !h.shows("Everything this PC can check looks right."));
+    assert!(!h.has("Open Windows Security"));
     h.click("Open network settings");
     assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
     assert_eq!(h.acts(), vec![]);
     // On any other network, of a speaker that stays silent until it has
-    // reached this PC: the finding, with no network to send people to.
+    // connected back: a firewall on this PC is what may be why, with the
+    // way to Windows' list of the apps its firewall lets through.
     let port = cant_tell(true, None);
-    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("Kitchen hasn’t reached this PC since it was connected."));
-    assert!(h.shows("AirPlay speakers usually have to reach the PC before they play. A firewall on this PC may be stopping it."));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen hasn’t connected back to this PC.") && h.has("Try Kitchen again"));
+    assert!(h.has("A firewall on this PC may be stopping Kitchen."));
+    assert!(h.shows("choose Allow an app through firewall") && h.shows("Then try Kitchen again."));
     assert!(!h.shows("public network") && !h.has("Open network settings") && !h.shows("Everything this PC can check looks right."));
-    // A speaker that has reached this PC: the page says nothing of it,
-    // on a public network either.
+    h.click("Open Windows Security");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::WindowsSecurity)]);
+    assert_eq!(h.acts(), vec![]);
+    // A speaker that has connected back: the page says nothing of it.
     let port = cant_tell(false, None);
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(!h.shows("hasn’t reached this PC") && h.shows("Everything this PC can check looks right."));
+    assert!(h.has("This PC can’t tell whether Kitchen is playing."));
+    assert!(!h.shows("connected back") && h.shows("Everything this PC can check looks right."));
 }
 
 #[test]
