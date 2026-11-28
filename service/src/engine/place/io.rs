@@ -69,6 +69,9 @@ pub struct World {
     pub panel_open: bool,
     /// Music Assistant plays this PC's sound (while it is the place).
     pub music_assistant_playing: bool,
+    /// The app can't read this PC's sound and keeps trying to: what it
+    /// sends meanwhile is silence.
+    pub sound_unreadable: bool,
 }
 
 impl World {

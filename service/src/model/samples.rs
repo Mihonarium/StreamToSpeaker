@@ -376,6 +376,10 @@ pub fn named(name: &str) -> Scene {
             app: "Chrome".into(),
             output: s.outputs[0].id.clone(),
         }),
+        "kitchen-cant-read-sound" => {
+            s.situation.standing.push(Standing::CantReadSound { speaker: k.clone() });
+            s.situation.amber = true;
+        }
         "kitchen-only-chosen-apps" => {
             s.situation.only_some_apps = true;
             s.situation.doing = Doing::NothingPlaying;
@@ -603,6 +607,7 @@ macro_rules! with_sample_names {
             "kitchen-change-stops-sound",
             "kitchen-away",
             "kitchen-except-an-app",
+            "kitchen-cant-read-sound",
             "kitchen-only-chosen-apps",
             "kitchen-muted",
             "kitchen-full-volume",

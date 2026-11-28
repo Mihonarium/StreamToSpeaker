@@ -298,6 +298,13 @@ fn state_line(scene: &Scene) -> StateLine {
         if sit
             .standing
             .iter()
+            .any(|s| matches!(s, Standing::CantReadSound { .. }))
+        {
+            return line(Sign::Warn, t!(lang, RowCantReadSound));
+        }
+        if sit
+            .standing
+            .iter()
             .any(|s| matches!(s, Standing::PausedAtSpeaker { .. }))
         {
             return line(Sign::Still, t!(lang, PausedOnSpeaker));

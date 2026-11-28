@@ -58,6 +58,7 @@ pub fn world() -> World {
         screen_reader: false,
         panel_open: false,
         music_assistant_playing: false,
+        sound_unreadable: false,
     }
 }
 

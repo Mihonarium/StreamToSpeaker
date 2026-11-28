@@ -314,6 +314,20 @@ pub(super) fn standing(scene: &Scene) -> Option<NoteView> {
             t!(lang, WindowsDidntSwitchLine),
             Act::open(t!(lang, OpenWindowsSound), Open::SoundSettings),
         )
+    } else if let Some(Standing::CantReadSound { speaker }) = conditions
+        .iter()
+        .find(|s| matches!(s, Standing::CantReadSound { .. }))
+    {
+        // The words of the playback check's step, and its way out.
+        (
+            t!(lang, CantReadSound),
+            t!(
+                lang,
+                SetCheckInputLostLine,
+                speaker = &scene.speaker_name(speaker)
+            ),
+            switch_to_pc(lang),
+        )
     } else if conditions.contains(&Standing::MusicAssistantNotConnected) {
         (
             t!(lang, MaNotConnected),

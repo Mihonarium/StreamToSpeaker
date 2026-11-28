@@ -41,7 +41,9 @@ impl Core {
         // The badge: sound isn't heard where it should be, or the app moved
         // it for a failure that still stands. A closed note changes neither.
         let unheard = self.implied_note(w, now).is_some_and(|n| n.ahead == Some(Ahead::InAFewSeconds));
-        let amber = unheard || self.note.as_ref().is_some_and(|n| n.note.shows() && n.note.failure());
+        let standing = self.standing(w, now);
+        let silent = standing.iter().any(|s| matches!(s, Standing::CantReadSound { .. }));
+        let amber = unheard || silent || self.note.as_ref().is_some_and(|n| n.note.shows() && n.note.failure());
         let picking = self.switch.as_ref().map(|s| Picking {
             speaker: s.speaker.clone(),
             way: s.way,
@@ -92,7 +94,7 @@ impl Core {
             note,
             picking,
             pick_failed: self.pick_failed.as_ref().map(|(p, _)| p.clone()),
-            standing: self.standing(w, now),
+            standing,
             speakers,
             confirm_in_panel,
             confirm_under_routing: self.confirm.as_ref().and_then(|c| c.routing),
@@ -212,6 +214,11 @@ impl Core {
             }
             if self.paused_at_speaker && matches!(self.stream, Stream::On { .. }) {
                 standing.push(Standing::PausedAtSpeaker { speaker: k.clone() });
+            }
+            // What the app sends while it can't read this PC's sound is
+            // silence.
+            if w.sound_unreadable && matches!(self.stream, Stream::On { .. }) {
+                standing.push(Standing::CantReadSound { speaker: k.clone() });
             }
         }
         if let Some(room) = &self.joined {

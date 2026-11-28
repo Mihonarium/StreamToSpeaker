@@ -285,6 +285,7 @@ impl PlaceDriver {
             screen_reader: self.platform.desk.screen_reader(),
             panel_open: self.panel_open,
             music_assistant_playing: ma_playing,
+            sound_unreadable: app.sound_input_lost(),
         };
         Observation { world, players, ours, outputs: enabled, airplay, networks }
     }

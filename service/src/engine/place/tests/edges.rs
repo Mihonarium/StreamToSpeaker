@@ -255,6 +255,32 @@ fn at_the_edges() {
             },
         },
         Row {
+            name: "the app can't read this PC's sound while a speaker plays it",
+            given: Rig::playing_on_kitchen,
+            when: |r| {
+                r.w.sound_unreadable = true;
+                r.tick();
+            },
+            then: |r, _| {
+                let lost = Standing::CantReadSound { speaker: id(K) };
+                // The speaker is silent: said for as long as it lasts,
+                // with the badge on the icon.
+                let s = r.sit();
+                assert_eq!(s.doing, Doing::Playing);
+                assert!(s.standing.contains(&lost) && s.amber);
+                r.w.sound_unreadable = false;
+                r.tick();
+                let s = r.sit();
+                assert!(!s.standing.contains(&lost) && !s.amber);
+                // On this PC nothing is sent, so nothing is lost.
+                r.w.sound_unreadable = true;
+                r.cmd(Command::Switch { place: Place::ThisPc, way: None }).unwrap();
+                r.tick();
+                let s = r.sit();
+                assert!(!s.standing.contains(&lost) && !s.amber);
+            },
+        },
+        Row {
             name: "while this PC is the place, what still arrives at the app's device plays on its output",
             given: Rig::on_kitchen,
             when: |r| {

@@ -1165,6 +1165,26 @@ fn closing_the_window_restores_the_delay_keys() {
 }
 
 #[test]
+fn the_panel_says_when_the_app_cant_read_this_pcs_sound() {
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    let lost = Standing::CantReadSound { speaker: id() };
+    let line = |r: &mut Rig| crate::model::panel::panel(&r.driver.scene()).place.state.text;
+    assert!(!r.driver.situation().standing.contains(&lost));
+    r.app.note_sound_input_lost("the sound device went away");
+    r.driver.look();
+    let sit = r.driver.situation();
+    assert!(sit.standing.contains(&lost) && sit.amber);
+    assert_eq!(line(&mut r), "Can’t read this PC’s sound");
+    r.app.note_sound_input_back();
+    r.driver.look();
+    let sit = r.driver.situation();
+    assert!(!sit.standing.contains(&lost) && !sit.amber);
+    assert_ne!(line(&mut r), "Can’t read this PC’s sound");
+}
+
+#[test]
 fn delay_keys_do_nothing_while_the_speaker_is_paused() {
     let fake = FakeRenderer::start(answer);
     let mut r = Rig::new(&fake, with_shortcuts());
