@@ -55,49 +55,58 @@ if (-not $SkipDriver) {
     # SAME number ends up in:
     #   - driver.h's STREAM_TO_SPEAKER_DRIVER_BUILD (returned via IOCTL,
     #     logged by the service: 'driver opened build=N')
-    #   - the INF's DriverVer (<prefix>.N — what Device Manager shows,
+    #   - the INF's DriverVer (<prefix>.N, what Device Manager shows,
     #     what PnP uses to compare versions; prefix is set in the
     #     vcxproj's DriverVersionPrefix)
     # Override with -DriverBuild N for reproducible local repro.
     $buildNum = if ($DriverBuild -gt 0) { $DriverBuild } else { [int]((git rev-list --count HEAD).Trim()) }
+    # driver.h is stamped for this build only and put back afterwards, byte
+    # for byte: a stamped driver.h left in the working tree changes the
+    # driver source, which no longer matches the certified driver if it is
+    # ever committed (CLAUDE.md, "Certification is per binary").
     $driverHeader = Join-Path $repoRoot "driver\driver.h"
-    $content = Get-Content $driverHeader -Raw
-    $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
-    Set-Content -Path $driverHeader -Value $new -NoNewline
-    Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=<prefix>.$buildNum)"
-    $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
-    if (-not $msbuild) {
-        $candidates = @(
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
-        )
-        $msbuild = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $originalHeader = [IO.File]::ReadAllBytes($driverHeader)
+    try {
+        $content = Get-Content $driverHeader -Raw
+        $new = $content -replace '(STREAM_TO_SPEAKER_DRIVER_BUILD\s+)\d+u', "`${1}${buildNum}u"
+        Set-Content -Path $driverHeader -Value $new -NoNewline
+        Write-Step "Building driver ($Configuration|x64, SignMode=$SignMode, build=$buildNum, DriverVer=<prefix>.$buildNum)"
+        $msbuild = Get-Command msbuild.exe -ErrorAction SilentlyContinue
         if (-not $msbuild) {
-            throw "msbuild.exe not found on PATH or in standard VS2022 locations. Install VS 2022 Build Tools + WDK."
+            $candidates = @(
+                "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+                "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
+                "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
+                "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+            )
+            $msbuild = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $msbuild) {
+                throw "msbuild.exe not found on PATH or in standard VS2022 locations. Install VS 2022 Build Tools + WDK."
+            }
+            $msbuildExe = $msbuild
+        } else {
+            $msbuildExe = $msbuild.Source
         }
-        $msbuildExe = $msbuild
-    } else {
-        $msbuildExe = $msbuild.Source
-    }
-    if ($SignMode -eq "TestSign") {
-        # vcxproj's TestSign target uses signtool /a - picks the first
-        # code-signing cert it finds in CurrentUser\My. Warn if none.
-        $certs = Get-ChildItem Cert:\CurrentUser\My `
-            | Where-Object { $_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq "1.3.6.1.5.5.7.3.3" } }
-        if (-not $certs) {
-            Write-Warning "No code-signing cert in CurrentUser\My; the TestSign step will fail. Create one with New-SelfSignedCertificate, or pass -SignMode Off to skip signing."
+        if ($SignMode -eq "TestSign") {
+            # vcxproj's TestSign target uses signtool /a - picks the first
+            # code-signing cert it finds in CurrentUser\My. Warn if none.
+            $certs = Get-ChildItem Cert:\CurrentUser\My `
+                | Where-Object { $_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq "1.3.6.1.5.5.7.3.3" } }
+            if (-not $certs) {
+                Write-Warning "No code-signing cert in CurrentUser\My; the TestSign step will fail. Create one with New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Stream To Speaker (test sign)' -CertStoreLocation Cert:\CurrentUser\My, or pass -SignMode Off to skip signing."
+            }
         }
+        & $msbuildExe (Join-Path $repoRoot "driver\StreamToSpeaker.sln") `
+            "/p:Configuration=$Configuration" `
+            "/p:Platform=x64" `
+            "/p:SignMode=$SignMode" `
+            "/p:DriverBuildNumber=$buildNum" `
+            "/nologo" `
+            "/verbosity:minimal"
+        if ($LASTEXITCODE -ne 0) { throw "Driver build failed (exit $LASTEXITCODE)" }
+    } finally {
+        [IO.File]::WriteAllBytes($driverHeader, $originalHeader)
     }
-    & $msbuildExe (Join-Path $repoRoot "driver\StreamToSpeaker.sln") `
-        "/p:Configuration=$Configuration" `
-        "/p:Platform=x64" `
-        "/p:SignMode=$SignMode" `
-        "/p:DriverBuildNumber=$buildNum" `
-        "/nologo" `
-        "/verbosity:minimal"
-    if ($LASTEXITCODE -ne 0) { throw "Driver build failed (exit $LASTEXITCODE)" }
 } else {
     Write-Step "Skipping driver build (-SkipDriver)"
 }
@@ -152,6 +161,22 @@ foreach ($name in $wanted) {
     }
 }
 
+# The certificate that signed a test-signed driver, which the installer
+# makes the target PC trust (StreamToSpeaker.iss). Taken from the .sys's own
+# signature, so it is the one signtool /a actually picked.
+$stagedSys = Join-Path $staging "StreamToSpeaker.sys"
+$signature = Get-AuthenticodeSignature -LiteralPath $stagedSys
+if ($signature.SignerCertificate -and $signature.SignerCertificate.Subject -eq $signature.SignerCertificate.Issuer) {
+    $cer = Join-Path $staging "StreamToSpeaker.cer"
+    [IO.File]::WriteAllBytes($cer, $signature.SignerCertificate.Export("Cert"))
+    Write-Host "  staged the test certificate $($signature.SignerCertificate.Subject) ($($signature.SignerCertificate.Thumbprint))"
+    if ($signature.SignerCertificate.Subject -ne "CN=Stream To Speaker (test sign)") {
+        Write-Warning "The driver is signed with '$($signature.SignerCertificate.Subject)'. The installer makes the target PC trust it, but its uninstaller only removes certificates named 'CN=Stream To Speaker (test sign)'."
+    }
+} elseif (-not $signature.SignerCertificate) {
+    Write-Host "  (no test certificate staged - the driver isn't signed)"
+}
+
 # devcon.exe from the WDK - needed at install time to add the
 # root-enumerated StreamToSpeaker device. Search common WDK locations
 # and copy the x64 build into the staging dir.
@@ -173,13 +198,22 @@ Write-Host "  staged $($devcon.FullName)"
 # ---------------------------------------------------------------------------
 if (-not $SkipInstaller) {
     Write-Step "Building installer (Inno Setup)"
+    # Wherever Inno Setup was installed (its uninstall entry says where),
+    # then the usual folders.
     $isccCandidates = @(
+        foreach ($view in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall") {
+            Get-ChildItem -Path $view -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -like "Inno Setup *_is1" } |
+                Sort-Object PSChildName -Descending |
+                ForEach-Object { Join-Path ($_.GetValue("InstallLocation")) "ISCC.exe" }
+        }
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
     )
-    $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $iscc = $isccCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
     if (-not $iscc) {
-        throw "ISCC.exe (Inno Setup 6) not found. Install from https://jrsoftware.org/isdl.php - or 'choco install innosetup'."
+        throw "ISCC.exe (Inno Setup 6.3 or later) not found. Install it from https://jrsoftware.org/isdl.php - or 'choco install innosetup'."
     }
     # Derive the strict X.Y.Z.W numeric version that the PE resource
     # format requires - Inno's VersionInfoVersion rejects pre-release

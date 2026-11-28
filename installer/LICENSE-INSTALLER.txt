@@ -15,9 +15,10 @@ personal or commercial, on any number of machines.
 You may not redistribute the installer or the installed files (mirror,
 re-host, or bundle them into another installer, package, or product),
 and you may not modify them or reuse their signatures or catalog files.
-That is because they carry our code-signing certificate and a Microsoft
-attestation signature for the kernel driver; those signatures identify
-us, so they only belong on builds we made. Full terms:
+That is because release builds carry our code-signing signature, and
+their kernel driver a signature from Microsoft (test builds: our test
+signature); those signatures identify us, so they only belong on builds
+we made. Full terms:
 https://github.com/Mihonarium/StreamToSpeaker/blob/main/LICENSE-BINARIES.md
 
 The name "Stream To Speaker" and our logos are reserved; do not use

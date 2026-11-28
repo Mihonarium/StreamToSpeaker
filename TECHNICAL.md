@@ -70,8 +70,9 @@ cargo build --release
 `pnputil /add-driver` only stages an upgrade, and the driver's control device
 keeps the loaded image in memory until Windows restarts, so a new driver binary
 only runs after a reboot (disabling and re-enabling the device is not enough).
-The installer asks for a restart when an upgrade replaces the driver binary
-that was installed before. The service log line
+The installer asks for a restart when the driver Windows has loaded is not the
+one it just installed (it compares the loaded image, not the file on disk). The
+service log line
 `StreamToSpeaker driver opened (proto=1 build=N ...)` confirms which build is
 live — `N` bumps on every shipped binary.
 
@@ -83,17 +84,97 @@ live — `N` bumps on every shipped binary.
 .\installer\build-installer.ps1 -Version 0.1.0-rc.1
 ```
 
-Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. It installs the
-service to `Program Files`, stages the driver with `pnputil /add-driver
-/install`, runs `scripts\Rename-Endpoint.ps1`, and optionally adds Start Menu,
-desktop and autostart entries. `Pre-Install.ps1` and `Rename-Endpoint.ps1`
-log to `logs\install.log` in the install directory, not to
-`%LOCALAPPDATA%`; `scripts\Diagnose.ps1` prints its tail. Uninstall removes the driver
-via `Uninstall-Driver.ps1`, removes the test-signing certificate a test-signed
-build imported into `LocalMachine\Root` and `TrustedPublisher`
-(`Remove-TestCertificate.ps1`; an upgrade removes the replaced build's
-certificate when it differs), and deletes the install directory. It leaves
-each person's own folders, so a reinstall keeps their speakers and pairings:
+Output: `installer\out\StreamToSpeakerSetup-<version>.exe`. Needs Inno Setup
+6.3 or later. Setup installs in `C:\Program Files\Stream To Speaker` and
+nowhere else: it installs a driver and the uninstaller runs its files as
+administrator, so they must be where only administrators can change them.
+It has no folder page and refuses a `/DIR=` that names another folder (exit
+code 1). Setup:
+
+1. refuses, before changing anything (exit code 7), Windows Server, where the
+   driver doesn't run (`/ALLOWSERVER` lets the installer lifecycle test run
+   on its Windows Server runners), and a test build on a PC whose Windows
+   isn't in test-signing mode, where its driver can't start
+   (`/ALLOWTESTBUILD` installs it all the same, for a developer's PC that
+   loads test-signed drivers in another way: a kernel debugger, or signature
+   enforcement turned off at boot, neither of which Setup can see);
+2. once Install is clicked, closes the copies of the app that run from the
+   install folder, in any account (a silent install doesn't ask), by
+   process; a copy started from anywhere else is left alone
+   (`scripts\Find-RunningCopies.ps1`). Afterwards Setup starts the app only
+   as the person who uses it, never with administrator rights. It can do
+   that when it asked for those rights itself: started the usual way, it
+   shows the Windows prompt (an administrator's password there is fine) and
+   keeps its first copy, which has no such rights, to start programs as
+   that person. Started with administrator rights ("Run as administrator",
+   an elevated prompt, a deployment tool) or as SYSTEM, it starts nothing,
+   and its last page says to start the app from the Start menu and why.
+   Until then no copy runs, and Windows' default output is the one it used
+   before;
+3. runs `scripts\Install-Driver.ps1`, which installs the driver package and
+   reports what happened: an update whose driver is already installed leaves
+   the device, its sound output and Windows' audio services alone; a new
+   driver goes into the driver store first and then onto the existing device,
+   updated in place, so its sound output and Windows' choice of output should
+   stay (not yet confirmed on real hardware); the device is created with
+   `devcon install` only when there is none; an output that still has an
+   early build's cached settings is rebuilt, and so is a working device when
+   Windows has no Stream To Speaker output at all although its two sound
+   services run (a new device first, the old one removed only once the new
+   one works; the new output gets the old one's default-output roles). While
+   those services are stopped no output can appear, so a missing output is
+   no reason to rebuild then: the step does only what is due otherwise (the
+   first device, another driver) and reports that the sound output is
+   missing (exit code 20), or that a restart is due (3010). After an update or a
+   rebuild that failed, it reads the earlier device back before it reports
+   that the device was kept, and removes a device it made itself. With more
+   than one device, the one Windows plays to stays. Earlier driver packages,
+   and the test certificates only they needed, go once the new driver runs;
+   when that takes a restart, they go the next time Setup runs, or at
+   uninstall. The decisions
+   are plain functions in `scripts\InstallerFunctions.ps1`, tested by
+   `scripts\tests\*.Tests.ps1` (Windows PowerShell). The same script repairs
+   an installed copy on its own, elevated:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Stream To Speaker\scripts\Install-Driver.ps1"`;
+   its last line is `driver-step-result: <result> restart=0|1 ...` and its
+   exit code 0 (working), 3010 (working after a restart) or 20-25 (see the
+   script);
+4. adds an inbound Windows Firewall rule for the app on private and work
+   networks (`scripts\Set-FirewallRule.ps1`);
+5. writes "start at sign-in" for the account that ran Setup, not the
+   administrator who approved it;
+6. when an earlier version was installed in another folder, takes over its
+   uninstall entry, shortcuts and start-at-sign-in entries and removes from
+   that folder, by name, only the files releases put there (nothing in it is
+   run; nothing is deleted through a link or junction); the folder goes when
+   it is empty (`scripts\Remove-EarlierInstall.ps1`).
+
+The Start-menu entry is always made and carries the AppUserModelID
+`StreamToSpeaker.App`, which the app must use too when it shows Windows
+notifications. Setup's last page says what happened and what to do. Exit
+codes besides Inno Setup's own: 20 when Setup couldn't finish setting up the
+sound driver, 3010 for a silent install that needs a restart (a silent
+install never restarts the PC). The scripts log to `logs\install.log` in the
+install directory, not to `%LOCALAPPDATA%`. That file names the Windows
+account and the PC, so a report should carry the output of
+`scripts\Diagnose.ps1` instead: a report of the driver, the device, the sound
+output and the firewall, with names and addresses replaced (it asks, first
+and last, to be read through before it is posted); Setup's last page gives
+that command when Windows refused the driver. `scripts\Reset-Install.ps1`
+clears the driver for a fresh start. Uninstall
+closes the app, moves Windows off the app's sound output where the PC has
+another output that works, and removes the device, the driver packages, the
+test certificates a test-signed build made Windows trust (`LocalMachine\Root`
+and `TrustedPublisher`), the firewall rules for the app and the
+start-at-sign-in entries of signed-in accounts; its last message names what it
+could not remove. Windows' cached entry for a sound output whose device is
+gone is deleted where Windows allows it; Windows can refuse, and an entry that
+stays does nothing (a new device gets an entry of its own). Run interactively,
+the uninstall asks for a restart when the driver was running, or when Windows
+removes the device only at the restart (after an update that itself waits for
+one); until then the device's sound output stays in Windows' list. The
+uninstall leaves each person's own folders, so a reinstall keeps their
+speakers and pairings:
 `%APPDATA%\StreamToSpeaker` (`config.json`, the settings, and `config.json.bak`,
 a second copy the app reads if the first is damaged) and
 `%LOCALAPPDATA%\StreamToSpeaker` (the log, `startup.txt`, and
@@ -110,8 +191,10 @@ they aren't needed.
 
 Windows caches an endpoint's display name in the registry on first enrolment
 and keeps it across reinstalls, so upgrades over an older install show the
-stale name. `scripts\Rename-Endpoint.ps1`, run elevated, overwrites it
-(`-Name` sets a custom one). The installer does this automatically.
+stale name. The installer replaces a name Windows made up ("Speakers (Stream To
+Speaker)", "Internal AUX Jack") and keeps one the person chose;
+`scripts\Rename-Endpoint.ps1`, run elevated, names the output by hand (`-Name`
+sets a custom one).
 
 ## Modes
 
@@ -333,6 +416,14 @@ signing repository.
 the driver's Microsoft attestation round-trip:
 [docs/driver-signing.md](docs/driver-signing.md).
 
+`installer-lifecycle.yml` installs, repairs, updates and uninstalls the built
+installer on a hosted Windows machine, upgrades from earlier releases, and
+checks what each step leaves behind: `build.yml` calls it on pull requests
+that touch the installer, and it can be started by hand against an earlier
+build's artifacts. What it cannot see (the name of the sound output, what
+happens after a restart) is covered by the scripts' own tests in
+`scripts\tests`.
+
 The WDK install and Rust dependencies are cached; a cold build is ~15-20 min,
 warm ~5.
 
@@ -343,7 +434,7 @@ StreamToSpeaker/
 ├── include/stream_to_speaker_ioctl.h   shared driver↔service ABI
 ├── driver/                             C++ kernel driver (PortCls / WaveRT)
 ├── installer/                          Inno Setup script + build-installer.ps1
-├── scripts/                            endpoint rename, driver uninstall
+├── scripts/                            the installer's driver, firewall and uninstall steps; Diagnose
 ├── docs/                               signing pipeline, specs, plans
 └── service/src/
     ├── main.rs          CLI parsing, mode dispatch
