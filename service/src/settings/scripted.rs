@@ -438,6 +438,7 @@ pub fn example() -> State {
             played: None,
             paused: false,
             token: Some("SP:0f3a9c2e7b5d41a8c6e0b9d2f1a47e3c".into()),
+            public_network: None,
         },
         privacy: PrivacyView {
             only_playing: true,

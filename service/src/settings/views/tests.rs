@@ -934,6 +934,34 @@ fn cant_hear_says_why_the_sound_stayed_on_this_pc() {
 }
 
 #[test]
+fn music_assistant_says_when_a_public_network_may_keep_it_out() {
+    let line = "Windows treats “HomeNet” as a public network";
+    // Not found yet: under the first step, with the way to Windows'
+    // network settings.
+    let port = scripted(|s| {
+        s.ma.public_network = Some("HomeNet".into());
+        s.ma.found_by = None;
+    });
+    let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(h.shows(line));
+    h.click_link("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    // Set up earlier and not connected now.
+    let port = scripted(|s| {
+        s.ma.public_network = Some("HomeNet".into());
+        s.ma.found_by = None;
+        s.ma.code = None;
+        s.ma.paired_with = vec!["Music Assistant (Home)".into()];
+    });
+    let h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(h.shows(line) && h.shows("isn’t connected to this PC right now"));
+    // Connected: the page says nothing about the network.
+    let port = scripted(|s| s.ma.public_network = Some("HomeNet".into()));
+    let h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
+    assert!(!h.shows(line));
+}
+
+#[test]
 fn music_assistant_about_and_lab_act_at_once() {
     let port = scripted(|s| s.ma.paused = true);
     let mut h = H::new(port.clone(), Box::new(MusicAssistantView::new(port)), snap("kitchen-playing"));
@@ -1239,6 +1267,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.ma.found_by = None;
             s.ma.code = None;
             s.ma.paired_with = vec!["x".into()];
+            s.ma.public_network = Some("HomeNet".into());
         },
         |s| s.about.updates.state = UpdateState::DevBuild,
         |s| {

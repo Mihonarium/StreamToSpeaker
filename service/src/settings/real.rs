@@ -577,6 +577,16 @@ impl SettingsPort for AppSettings {
         } else {
             played_at.map(|t| earlier_day(t, now_unix(), self.desktop.utc_offset_secs()))
         };
+        // Music Assistant has to reach this PC. While it hasn't, a network
+        // the app looks on that Windows treats as public is worth saying.
+        let public_network = (found_by.is_none() && failed.is_none())
+            .then(|| find_lines(&app.discovery_net_status().scope, &app.network_adapters(), &self.networks(), 0))
+            .into_iter()
+            .flatten()
+            .find_map(|l| match l {
+                FindLine::Profile { network, private: false } => Some(network),
+                _ => None,
+            });
         MaView {
             offer: app.is_sendspin_available().then(|| app.is_sendspin_source_enabled() || app.user_config.lock().unwrap().sendspin.source_enabled),
             failed,
@@ -587,6 +597,7 @@ impl SettingsPort for AppSettings {
             played,
             paused: app.is_sendspin_pairing_paused(),
             token: app.is_sendspin_source_enabled().then(|| app.sendspin_pairing_token()),
+            public_network,
         }
     }
 

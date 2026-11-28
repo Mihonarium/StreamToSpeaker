@@ -46,7 +46,7 @@ impl ViewContent for MusicAssistantView {
         ViewBar { title: w!(lang, MaName), line: Some(state_words(lang, &v)), button: None }
     }
 
-    fn show(&mut self, ui: &mut Ui, _snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
+    fn show(&mut self, ui: &mut Ui, _snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
         let lang = self.port.lang();
         ui.spacing_mut().item_spacing.y = 8.0;
         let v = self.port.music_assistant();
@@ -89,6 +89,7 @@ impl ViewContent for MusicAssistantView {
             if v.failed.is_none() {
                 sentence(ui, &w!(lang, SetMaNotConnected));
             }
+            public_network(ui, lang, &v, ask);
             paired_lines(ui);
         } else {
             let mark = |done: bool, current: bool| {
@@ -108,7 +109,10 @@ impl ViewContent for MusicAssistantView {
                     }
                 }
                 Some((server, None)) => sentence(ui, &w!(lang, SetMaFound, server = server, pc = pc)),
-                None => sentence(ui, &w!(lang, SetMaStep1Line, pc = pc)),
+                None => {
+                    sentence(ui, &w!(lang, SetMaStep1Line, pc = pc));
+                    public_network(ui, lang, &v, ask);
+                }
             });
             step(ui, 2, mark(paired, connected && !paired), &w!(lang, SetMaStep2), |ui| {
                 if paired {
@@ -154,6 +158,15 @@ impl ViewContent for MusicAssistantView {
     fn holds_unused_text(&self) -> bool {
         let shown = self.port.music_assistant().appears_as;
         self.st.typing.get("appears-as").is_some_and(|t| t.trim() != shown)
+    }
+}
+
+/// While Music Assistant isn't connected: that Windows treats the network
+/// as public, where it does. Music Assistant has to reach this PC.
+fn public_network(ui: &mut Ui, lang: crate::model::text::Lang, v: &MaView, ask: &mut dyn FnMut(Ask)) {
+    let Some(network) = &v.public_network else { return };
+    if marked(ui, Mark::Warning, Tone::Primary, &w!(lang, SetMaPublicLine, network = network), &[&w!(lang, SetOpenNetworkSettings)]).is_some() {
+        ask(Ask::Open(crate::model::command::Open::NetworkSettings));
     }
 }
 

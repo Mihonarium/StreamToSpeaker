@@ -241,6 +241,10 @@ pub struct MaView {
     pub paused: bool,
     /// The token for another Sendspin server.
     pub token: Option<String>,
+    /// Music Assistant isn't connected, and Windows treats this network,
+    /// which the app looks on, as public. Windows Firewall, which the app
+    /// doesn't read, may keep Music Assistant from reaching this PC.
+    pub public_network: Option<String>,
 }
 
 // -------------------------------------------------------------------------

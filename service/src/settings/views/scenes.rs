@@ -82,6 +82,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-music-assistant-setting-up", 1120.0, ma_setting_up),
         s("view-music-assistant-done", 1100.0, ma_done),
         s("view-music-assistant-not-connected", 1100.0, ma_not_connected),
+        s("view-music-assistant-public-network", 1100.0, ma_public_network),
         s("view-about", 880.0, about),
         s("view-about-up-to-date", 760.0, about_latest),
         s("view-lab", 1300.0, lab),
@@ -610,6 +611,15 @@ fn ma_done(ui: &mut Ui, _: &mut Stage) {
         s.ma.code = None;
         s.ma.paired_with = vec!["Music Assistant (Home)".into()];
         s.ma.played = Some(None);
+    });
+}
+
+/// Not found yet, on a network Windows treats as public.
+fn ma_public_network(ui: &mut Ui, _: &mut Stage) {
+    ma(ui, "ma-public-network", |s| {
+        s.ma.found_by = None;
+        s.ma.code = None;
+        s.ma.public_network = Some("HomeNet".into());
     });
 }
 
