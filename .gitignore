@@ -17,8 +17,8 @@ installer/out/
 installer/staging/
 installer/*.iss.log
 
-# Transcript of scripts\Pre-Install.ps1 / Rename-Endpoint.ps1 when run from a
-# checkout: they log to logs\install.log beside their own folder
+# Transcript of scripts\Install-Driver.ps1 / Rename-Endpoint.ps1 when run from
+# a checkout: they log to logs\install.log beside their own folder
 /logs/
 
 # CI prebuilt-driver cache (populated/restored by the build workflow)

@@ -326,6 +326,20 @@ class InstallerLifecycle(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertRegex(path, pattern)
 
+    def test_installer_scripts_and_their_tests_trigger_the_installer_phase(self):
+        steps = jobs_steps("build.yml")["installer-changes"]
+        script = "\n".join(line for step in steps for line in step_script(step))
+        pattern = re.search(r"grep -qE '([^']+)'", script).group(1)
+        # Setup packs the scripts, and the installer phase runs their tests.
+        for path in ("installer/StreamToSpeaker.iss", "scripts/Install-Driver.ps1",
+                     "scripts/InstallerFunctions.ps1", "scripts/Set-FirewallRule.ps1",
+                     "scripts/tests/InstallerFunctions.Tests.ps1"):
+            with self.subTest(path=path):
+                self.assertRegex(path, pattern)
+        for path in ("service/src/app.rs", "README.md", "docs/scripts/notes.ps1"):
+            with self.subTest(path=path):
+                self.assertNotRegex(path, pattern)
+
     def test_lifecycle_runs_output_repair(self):
         job = job_fields("installer-lifecycle.yml")["lifecycle"]
         if "if" in job:

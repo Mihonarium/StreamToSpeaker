@@ -418,9 +418,10 @@ the driver's Microsoft attestation round-trip:
 
 `installer-lifecycle.yml` installs, repairs, updates and uninstalls the built
 installer on a hosted Windows machine, upgrades from earlier releases, and
-checks what each step leaves behind: `build.yml` calls it on pull requests
-that touch the installer, and it can be started by hand against an earlier
-build's artifacts. What it cannot see (the name of the sound output, what
+checks what each step leaves behind; it also removes and disables the
+device and has the app's own Repair restore it. `build.yml` calls it on pull
+requests that touch the installer, its scripts or Repair, and it can be
+started by hand against an earlier build's artifacts. What it cannot see (the name of the sound output, what
 happens after a restart) is covered by the scripts' own tests in
 `scripts\tests`.
 
