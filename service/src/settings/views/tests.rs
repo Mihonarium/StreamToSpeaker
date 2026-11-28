@@ -703,6 +703,19 @@ fn cant_hear_says_what_the_panel_says_while_the_app_connects_by_itself() {
     let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-not-responding-trying"));
     assert!(h.has("Connecting to Kitchen…") && h.shows("Not responding. Trying again…"));
     assert!(!h.has("Not connected.") && !h.has("Connect"));
+    // Music Assistant picked a moment ago, its server not connected yet:
+    // the app is still waiting for it, so the step says that, and not yet
+    // that Music Assistant isn't connected.
+    let port = scripted(|s| {
+        s.playback.speaker = Some("Music Assistant".into());
+        s.playback.connected = Some(Err(()));
+        s.playback.server_away = true;
+        s.playback.taking = None;
+        s.playback.volume = None;
+    });
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-connecting"));
+    assert!(h.has("Connecting to Music Assistant…"));
+    assert!(!h.has("Music Assistant isn’t connected.") && !h.has("How to connect it") && !h.has("Connect"));
     // Nothing under way: the step is broken, and Connect is its fix.
     let port = not_connected();
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port.clone())), snap("kitchen-playing"));

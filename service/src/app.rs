@@ -8589,6 +8589,27 @@ mod tests {
         }
     }
 
+    /// `--player "Music Assistant"`: Music Assistant is listed once its
+    /// server is connected, so the wish waits for the server and picks
+    /// Music Assistant then.
+    #[test]
+    fn a_player_wish_for_music_assistant_waits_for_its_server() {
+        use crate::sendspin::source::SourceState;
+        use crate::sendspin_app::MA_OUTPUT_ID;
+        let app = test_app();
+        app.set_sendspin_source_enabled(true).unwrap();
+        app.connect_when_listed_every("Music Assistant".into(), Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(app.player_wish(), Some(PlayerWish::Looking { query: "Music Assistant".into() }));
+        assert!(!app.is_speaker_bound());
+        app.set_sendspin_source_state(SourceState::Connected { server: "Server".into(), streaming: false });
+        let chosen = || app.session.lock().unwrap().as_ref().is_some_and(|s| s.stable_id() == MA_OUTPUT_ID);
+        assert!(eventually(chosen), "{:?} {:?}", app.player_wish(), app.current_error());
+        // The wait is over once it plays there.
+        assert!(eventually(|| app.player_wish().is_none()), "{:?}", app.player_wish());
+        app.set_sendspin_source_enabled(false).unwrap();
+    }
+
     #[test]
     fn a_player_wish_with_the_engine_retries_only_when_the_speaker_returns() {
         let app = test_app();

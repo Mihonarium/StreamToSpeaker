@@ -174,6 +174,32 @@ fn names_and_handback_follow_only_changes_of_their_inputs() {
 }
 
 #[test]
+fn the_level_meter_shows_only_sound_that_reaches_the_place() {
+    use crate::engine::place_driver::run::sends_to_place;
+    use crate::model::samples;
+    let kitchen = samples::kitchen();
+    let playing = samples::named("kitchen-playing").situation;
+    assert!(sends_to_place(&playing, Some(&kitchen)));
+    // Connected to another speaker than the place, or to none.
+    assert!(!sends_to_place(&playing, Some(&id())));
+    assert!(!sends_to_place(&playing, None));
+    // Still connecting to it.
+    assert!(!sends_to_place(&samples::named("kitchen-connecting").situation, Some(&kitchen)));
+    // Music Assistant is the place and no server is connected: nothing of
+    // this PC's sound is heard, so the meter stays still.
+    let ma = SpeakerId::music_assistant();
+    let mut sit = samples::named("music-assistant-not-connected").situation;
+    assert!(sit.standing.contains(&Standing::MusicAssistantNotConnected));
+    assert!(!sends_to_place(&sit, Some(&ma)));
+    // Its server connected and hasn't started this PC's sound.
+    sit.standing = vec![Standing::MusicAssistantNotStarted];
+    assert!(!sends_to_place(&sit, Some(&ma)));
+    // It started the sound.
+    sit.standing.clear();
+    assert!(sends_to_place(&sit, Some(&ma)));
+}
+
+#[test]
 fn the_level_and_last_played_follow_the_speaker_that_became_the_place() {
     let fake = FakeRenderer::start(answer);
     let host = TestApp::with_speaker(&fake, UserConfig::in_memory());
