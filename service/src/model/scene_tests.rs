@@ -887,7 +887,7 @@ fn lasting_notes_and_repairs() {
         assert_note(view(&s).about, mark, title, body, button, false);
     }
     for (condition, mark, title, body, button) in [
-        (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose this app’s output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
+        (Standing::WindowsDidntSwitch { speaker: kitchen() }, Mark::Warn, "Windows didn’t switch to Kitchen", "Try again, or choose the Stream To Speaker output in Windows’ sound settings.", ("Open Windows’ sound settings", Command::Open(Open::SoundSettings))),
         (Standing::MusicAssistantNotStarted, Mark::Warn, "Music Assistant hasn’t started playing", "Start this PC’s sound in Music Assistant, or set Music Assistant to start it by itself.", ("How to start it", Command::Open(Open::MusicAssistantHowTo))),
         (Standing::MusicAssistantNotConnected, Mark::Warn, "Music Assistant isn’t connected", "This PC’s sound isn’t heard until it connects.", ("How to connect it", Command::Open(Open::MusicAssistantSettings))),
         (Standing::PausedAtSpeaker { speaker: kitchen() }, Mark::Warn, "Kitchen was paused", "It was paused with its own buttons or app, so this PC’s sound isn’t heard.", ("Switch to this PC", to_pc())),

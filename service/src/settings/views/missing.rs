@@ -174,6 +174,7 @@ impl MissingView {
     fn address_part(&mut self, ui: &mut Ui, lang: crate::model::text::Lang) {
         let probe = self.port.probe();
         plain(ui, &w!(lang, SetAddByItsAddress));
+        sentence(ui, &w!(lang, SetAddressWhere));
         let add = w!(lang, SetAddButton);
         let mut go = false;
         ui.horizontal(|ui| {
@@ -360,7 +361,7 @@ impl ViewContent for CheckView {
             match line {
                 FindLine::LookingOn { place: p, .. } => check_line(ui, Mark2::Good, &w!(lang, SetFindLooking, network = &place(p)), None, |_| ()),
                 FindLine::Vpn { vpn, only } => {
-                    check_line(ui, Mark2::Warning, &w!(lang, SetFindVpn, network = &place(vpn)), Some(&w!(lang, SetFindVpnLine)), |ui| {
+                    check_line(ui, Mark2::Warning, &w!(lang, SetFindVpn, network = &place(vpn)), Some(&w!(lang, SetFindVpnLine, adapter = &only.name)), |ui| {
                         if Button::standard(&w!(lang, SetLookOnlyOn, adapter = &only.name)).show(ui).clicked() {
                             self.port.act(Act::LookOnlyOn(only.key.clone()));
                         }
