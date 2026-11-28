@@ -5282,14 +5282,29 @@ impl App {
 
     /// Look at speaker `id` before sound plays on it: whether it answers,
     /// and whether it plays something else where it shows that. A UPnP
-    /// speaker is asked for its transport and what it plays; an AirPlay
-    /// receiver's announcement says whether another device sends to it,
-    /// and otherwise a connection to its control port (with nothing sent
-    /// on it) says whether it answers. Other speakers show nothing: free.
+    /// speaker is asked for its transport and what it plays (one added by
+    /// its address once its description is read, as a connect reads it).
+    /// An AirPlay receiver's announcement says whether another device
+    /// sends to it. Where nothing shows what plays, a connection to the
+    /// port a connect would use (with nothing sent on it) says whether
+    /// the speaker answers: an AirPlay receiver's control port, a Sendspin
+    /// speaker's port. Anything else (Music Assistant, a speaker no search
+    /// lists now) shows nothing: free.
     pub fn look_at_speaker(&self, id: &str) -> crate::engine::signals::SpeakerSignal {
         use crate::engine::signals::{answers_on, SpeakerSignal, STILL_THERE_WAIT};
         let _asking = crate::engine::cancel::asking_speaker();
-        if let Some(r) = self.discovery.as_ref().and_then(|d| d.find_by_id(id)) {
+        let by_address = self.find_manual_speaker(id);
+        let upnp = match self.discovery.as_ref().and_then(|d| d.find_by_id(id)) {
+            Some(r) => Some(r),
+            None => match by_address.as_ref().filter(|m| m.kind == ManualKind::Upnp) {
+                Some(m) => match self.manual_renderer(m) {
+                    Some(r) => Some(r),
+                    None => return SpeakerSignal::NotResponding,
+                },
+                None => None,
+            },
+        };
+        if let Some(r) = upnp {
             let Ok(local) = self.local_ip_toward(r.ip) else { return SpeakerSignal::NotResponding };
             let ours = format!("http://{}/", SocketAddr::new(local, self.config.bind.port()));
             let Ok(state) = upnp::get_transport_state(&r.av_transport_control_url) else {
@@ -5317,7 +5332,30 @@ impl App {
                 SpeakerSignal::NotResponding
             };
         }
-        SpeakerSignal::Free
+        let sendspin = self.sendspin.discovery.lock().unwrap().as_ref().and_then(|d| d.find_by_id(id));
+        let addr = match (sendspin, by_address) {
+            (Some(r), _) => SocketAddr::new(r.ip, r.port),
+            // An AirPlay speaker added by its address that the app hasn't
+            // connected to since it started.
+            (None, Some(m)) => match manual_speakers::resolve_ipv4(&m.host, m.port) {
+                Ok(ip) => SocketAddr::new(IpAddr::V4(ip), m.port),
+                Err(_) => return SpeakerSignal::NotResponding,
+            },
+            (None, None) => return SpeakerSignal::Free,
+        };
+        if answers_on(addr, STILL_THERE_WAIT) {
+            crate::engine::cancel::speaker_answered();
+            SpeakerSignal::Free
+        } else {
+            SpeakerSignal::NotResponding
+        }
+    }
+
+    /// Whether speaker `id` can be asked what it plays: a UPnP speaker,
+    /// found on the network or added by its address.
+    pub(crate) fn says_what_it_plays(&self, id: &str) -> bool {
+        self.discovery.as_ref().is_some_and(|d| d.find_by_id(id).is_some())
+            || self.find_manual_speaker(id).is_some_and(|m| m.kind == ManualKind::Upnp)
     }
 
     /// Whether `r`'s announcement says another device sends to it, unless
@@ -7852,6 +7890,56 @@ mod tests {
         app.connect_unless_user_picked("sendspin:kitchen", seen);
         assert_eq!(app.connecting_to(), None);
         assert_eq!(app.current_error(), None);
+    }
+
+    #[test]
+    fn a_look_asks_a_sendspin_speaker_whether_it_answers() {
+        use crate::engine::signals::SpeakerSignal;
+        use crate::sendspin::server::{SendspinDiscoveryState, SendspinRenderer};
+        let app = test_app();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let found = SendspinDiscoveryState::new();
+        found.insert(SendspinRenderer {
+            instance: "Kitchen".into(),
+            friendly_name: "Kitchen".into(),
+            ip: ip("127.0.0.1"),
+            port: listener.local_addr().unwrap().port(),
+            path: "/sendspin".into(),
+        });
+        *app.sendspin.discovery.lock().unwrap() = Some(found);
+        assert_eq!(app.look_at_speaker("sendspin:kitchen"), SpeakerSignal::Free);
+        // Switched off while its announcement is still remembered: it
+        // isn't taken for a speaker that can play again.
+        drop(listener);
+        assert_eq!(app.look_at_speaker("sendspin:kitchen"), SpeakerSignal::NotResponding);
+    }
+
+    #[test]
+    fn a_look_asks_a_speaker_added_by_its_address() {
+        use crate::engine::signals::SpeakerSignal;
+        use crate::fake_renderer::{renderer_description, FakeRenderer, Reply, AV_TRANSPORT};
+        let fake = FakeRenderer::start(|req| match req.soap_action() {
+            Some("GetTransportInfo") => Reply::soap_ok(AV_TRANSPORT, "GetTransportInfo", &[("CurrentTransportState", "PLAYING")]),
+            Some("GetMediaInfo") => Reply::soap_ok(AV_TRANSPORT, "GetMediaInfo", &[("CurrentURI", "x-sonos-spotify:track")]),
+            Some(action) => Reply::soap_ok(AV_TRANSPORT, action, &[]),
+            None => Reply::ok(&renderer_description("Den Amp", &[])),
+        });
+        let app = test_app();
+        let upnp = manual_upnp(&fake);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let airplay = ManualSpeaker { kind: ManualKind::AirPlay, name: "Study".into(), host: "127.0.0.1".into(), port };
+        // A UPnP speaker whose description nothing serves once the
+        // listener is closed.
+        let gone = ManualSpeaker { kind: ManualKind::Upnp, name: "Den".into(), host: format!("http://127.0.0.1:{port}/description.xml"), port: 0 };
+        app.user_config.lock().unwrap().manual_speakers.extend([upnp.clone(), airplay.clone(), gone.clone()]);
+        assert!(app.says_what_it_plays(&upnp.id()) && !app.says_what_it_plays(&airplay.id()));
+        assert_eq!(app.look_at_speaker(&upnp.id()), SpeakerSignal::PlayingElse { who: None });
+        assert_eq!(app.look_at_speaker(&airplay.id()), SpeakerSignal::Free);
+        // Switched off: neither kind is taken for a speaker that can play.
+        drop(listener);
+        assert_eq!(app.look_at_speaker(&airplay.id()), SpeakerSignal::NotResponding);
+        assert_eq!(app.look_at_speaker(&gone.id()), SpeakerSignal::NotResponding);
     }
 
     #[test]
