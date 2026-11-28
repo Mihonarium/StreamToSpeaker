@@ -4245,6 +4245,12 @@ impl App {
         self.discovery_error.lock().unwrap().clone()
     }
 
+    /// Sets why AirPlay speaker discovery isn't running.
+    #[cfg(test)]
+    pub(crate) fn set_airplay_discovery_error(&self, error: Option<String>) {
+        *self.discovery_error.lock().unwrap() = error;
+    }
+
     /// Network check: try again to start an AirPlay browse that failed to
     /// start (nothing else restarts it while the adapter scope holds).
     fn retry_failed_airplay_discovery(&self, scope: &Resolved) {

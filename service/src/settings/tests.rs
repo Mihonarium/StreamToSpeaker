@@ -715,6 +715,49 @@ fn the_search_check_names_each_network_and_what_windows_treats_it_as() {
 }
 
 #[test]
+fn the_search_check_names_the_search_that_couldnt_start() {
+    let (app, settings, _) = real();
+    let failed = || -> Vec<FindLine> {
+        let lines = settings.discovery_check().lines;
+        lines.into_iter().filter(|l| matches!(l, FindLine::AirPlaySearchFailed | FindLine::SendspinSearchFailed)).collect()
+    };
+    assert!(failed().is_empty());
+    *app.sendspin.discovery_error.lock().unwrap() = Some("no socket".into());
+    assert_eq!(failed(), [FindLine::SendspinSearchFailed]);
+    app.set_airplay_discovery_error(Some("no socket".into()));
+    assert_eq!(failed(), [FindLine::AirPlaySearchFailed, FindLine::SendspinSearchFailed]);
+    *app.sendspin.discovery_error.lock().unwrap() = None;
+    assert_eq!(failed(), [FindLine::AirPlaySearchFailed]);
+}
+
+#[test]
+fn music_assistants_page_hears_of_a_public_network_the_app_looks_on() {
+    use crate::discovery_net::NetAdapter;
+    use crate::model::facts::NetworkSeen;
+    use crate::model::situation::ConnKind;
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    app.set_network_adapters(vec![NetAdapter {
+        key: "{0A1B2C3D-0000-0000-0000-000000000001}".into(),
+        name: "Wi-Fi".into(),
+        ipv4: vec!["192.168.1.23".parse().unwrap()],
+    }]);
+    // Before the panel's state is there, nothing is known of the network.
+    assert_eq!(settings.music_assistant().public_network, None);
+    let mut scene = samples::named("kitchen-playing");
+    scene.networks = vec![NetworkSeen {
+        adapter: Some("0A1B2C3D-0000-0000-0000-000000000001".into()),
+        name: Some("HomeNet".into()),
+        private: Some(false),
+        kind: ConnKind::WiFi,
+    }];
+    let port = Arc::new(PortCore::new(view(scene, None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    // Music Assistant isn't connected, and it has to reach this PC.
+    assert_eq!(settings.music_assistant().public_network.as_deref(), Some("HomeNet"));
+}
+
+#[test]
 fn the_search_check_reads_the_networks_the_panel_knows() {
     use crate::discovery_net::NetAdapter;
     use crate::model::facts::NetworkSeen;
