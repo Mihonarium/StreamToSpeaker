@@ -1977,8 +1977,8 @@ impl App {
         }
         if verdict == Err(Refusal::NotGranted) && self.stream_gate.note_refusal(peer) {
             self.record_error(format!(
-                "Privacy mode refused a connection to the audio stream from {}. \
-                 Turn privacy mode off (Advanced) to let that device listen.",
+                "Refused a connection to the audio stream from {}: only the picked speaker \
+                 may listen. A refused device can be allowed on the speaker's page or the Lab page.",
                 self.describe_peer(peer)
             ));
         }
@@ -4386,8 +4386,8 @@ impl App {
             if let Resolved::Paused { name } = &*self.discovery_scope.lock().unwrap() {
                 self.record_error(format!(
                     "Speaker search is paused: the network adapter \"{}\" is unavailable. \
-                     It resumes when the adapter is back, or choose another adapter in \
-                     Advanced.",
+                     It resumes when the adapter is back; \"Look for speakers on\" under \
+                     \"Speaker missing?\" chooses another.",
                     name
                 ));
             }
@@ -7850,7 +7850,7 @@ mod tests {
         assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));
         let msg = app.current_error().expect("refusal recorded as a user-visible error");
         assert!(msg.contains("192.168.1.99"), "{msg}");
-        assert!(msg.contains("privacy mode off"), "{msg}");
+        assert!(msg.contains("can be allowed on the speaker's page"), "{msg}");
         // A repeat within the report interval is refused silently.
         app.dismiss_error();
         assert_eq!(app.check_stream_client(ip("192.168.1.99")), Err(Refusal::NotGranted));

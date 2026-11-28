@@ -1504,7 +1504,7 @@ fn encoder_failed(faults: &FaultSlot, stop_flag: &AtomicBool, detail: String, pl
     }
     faults.raise_unless_repeated("encoder_failed", FaultChannel::Media, detail, played, || {
         "Windows' AAC encoder failed again after reconnecting. The realtime stream doesn't use \
-         it: turn on \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
+         it: choose \"Less delay\" on the speaker's page, then select the speaker again."
             .to_string()
     });
 }
@@ -1598,11 +1598,11 @@ fn anchor_failed_message(
              then select the speaker again.",
             crate::PRODUCT_NAME
         ),
-        AnchorAdvice::FollowsOurClock if homepod => "it refused to start playing on this PC's clock. Turn off \
-             \"Use the buffered stream for single HomePods\" in Advanced, then select it again."
+        AnchorAdvice::FollowsOurClock if homepod => "it refused to start playing on this PC's clock. Choose \
+             \"Less delay\" on the HomePod's page, then select it again."
             .to_string(),
-        AnchorAdvice::FollowsOurClock => "it refused to start playing on this PC's clock. Turn on \
-             \"Prefer low-latency realtime\" in Advanced, then select the speaker again."
+        AnchorAdvice::FollowsOurClock => "it refused to start playing on this PC's clock. Choose \
+             \"Less delay\" on the speaker's page, then select the speaker again."
             .to_string(),
         AnchorAdvice::RefusedOnItsClock => {
             "it refused to start playing, although this PC was following its clock. Select it again.".to_string()
@@ -2297,7 +2297,7 @@ mod tests {
             let fault = rig.faults.get().unwrap();
             assert_eq!((fault.code, fault.retryable), ("encoder_failed", retryable), "round {round}");
             if !retryable {
-                assert!(fault.to_string().contains("Prefer low-latency realtime"), "{fault}");
+                assert!(fault.to_string().contains("\"Less delay\" on the speaker's page"), "{fault}");
             }
         }
     }
@@ -2338,8 +2338,8 @@ mod tests {
         assert!(neutral.contains("could not open UDP port 319") && !neutral.contains("program"), "{neutral}");
         let firewall = text(&refused, None, none, false);
         assert!(firewall.contains("Windows Firewall") && !firewall.contains("private"), "{firewall}");
-        assert!(text(&refused, None, follows_us, false).contains("Prefer low-latency realtime"));
-        assert!(text(&refused, None, follows_us, true).contains("Use the buffered stream for single HomePods"));
+        assert!(text(&refused, None, follows_us, false).contains("\"Less delay\" on the speaker's page"));
+        assert!(text(&refused, None, follows_us, true).contains("\"Less delay\" on the HomePod's page"));
         assert!(!text(&refused, None, locked, false).contains("Firewall"));
     }
 
