@@ -2998,9 +2998,20 @@ impl App {
         // up is stopped, not used.
         loop {
             if crate::engine::cancel::cancelled() {
+                // The session that stays bound plays on this very device
+                // (a grouped room's coordinator): a Stop for the connect
+                // nobody wants any more would stop the room that plays.
+                let plays_there = matches!(
+                    (guard.as_ref(), &new_session),
+                    (Some(ActiveSession::Upnp(bound)), ActiveSession::Upnp(new))
+                        if bound.renderer.same_device_as(&new.renderer)
+                );
                 drop(guard);
                 info!("a newer choice superseded the connect to {}; not binding", actual_id);
-                new_session.stop();
+                match new_session {
+                    ActiveSession::Upnp(new) if plays_there => unsubscribe_all(&new),
+                    other => other.stop(),
+                }
                 self.prune_stream_clients();
                 return Err(SUPERSEDED.to_string());
             }
