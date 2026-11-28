@@ -210,11 +210,12 @@ pub enum PairingInput {
     /// A version-0 pairing token (`SP:0…`) from the player.
     Token(String),
     /// A pairing code. `dynamic`: the player derives and shows/speaks it
-    /// during this attempt; `ask` blocks until the operator typed it
-    /// (`None` = cancelled). Static codes may be returned immediately.
+    /// during this attempt; `ask` is told when the attempt ends at the
+    /// latest and blocks until the operator typed the code (`None` =
+    /// cancelled). Static codes may be returned immediately.
     Code {
         dynamic: bool,
-        ask: Box<dyn Fn() -> Option<String> + Send>,
+        ask: Box<dyn Fn(Instant) -> Option<String> + Send>,
     },
 }
 

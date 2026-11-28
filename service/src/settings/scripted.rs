@@ -38,6 +38,8 @@ pub struct State {
     pub report_save: ReportSave,
     pub discovery: DiscoveryCheck,
     pub wanted: Option<Wanted>,
+    /// A password typed now is used for one connection and not saved.
+    pub password_once: bool,
     pub probe: Probe,
     pub tones: Vec<(String, ToneView)>,
 }
@@ -148,6 +150,9 @@ impl SettingsPort for ScriptedSettings {
     }
     fn wanted_dialog(&self) -> Option<Wanted> {
         self.state.lock().unwrap().wanted.clone()
+    }
+    fn password_once(&self, _id: &str) -> bool {
+        self.state.lock().unwrap().password_once
     }
     fn probe(&self) -> Probe {
         self.state.lock().unwrap().probe.clone()
@@ -431,9 +436,9 @@ pub fn example() -> State {
             failed: None,
             appears_as: "DESKTOP-7Q".into(),
             // As the app is told: Music Assistant's name, without its
-            // address or how long its code stays.
+            // address.
             found_by: Some(("Music Assistant (Home)".into(), None)),
-            code: Some(("482917".into(), None)),
+            code: Some(("482917".into(), Some(102))),
             paired_with: vec![],
             played: None,
             paused: false,
@@ -510,6 +515,7 @@ pub fn example() -> State {
             ],
         },
         wanted: None,
+        password_once: false,
         probe: Probe::Idle,
         tones: vec![(
             "kitchen".into(),

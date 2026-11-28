@@ -1581,7 +1581,7 @@ pub fn english(key: Key) -> Template {
         SetLookAtTv => text("Look at {speaker}: it’s showing a 4-digit code now. A wrong try makes it show a new one."),
         SetAskingForCode => text("Asking {speaker} to show a code…"),
         SetCheckingCode => text("Checking the code…"),
-        SetNoAnswerPairing => text("{speaker} didn’t show a code."),
+        SetNoAnswerPairing => text("Asking {speaker} to show a code didn’t work."),
         SetTimeRanOut => text("Time ran out."),
         SetNewCode => text("Show a new code"),
         SetCodeWrong => text("That code didn’t work. {speaker} is showing a new code."),

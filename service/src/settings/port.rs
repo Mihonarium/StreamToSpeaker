@@ -36,6 +36,12 @@ pub trait SettingsPort: Send + Sync {
     /// A dialog the app needs now (a speaker asks for its code or password
     /// while connecting; Music Assistant is pairing).
     fn wanted_dialog(&self) -> Option<Wanted>;
+    /// Whether a password typed for this speaker now is used for one
+    /// connection and not saved (a device that answers with another
+    /// speaker's identity).
+    fn password_once(&self, _id: &str) -> bool {
+        false
+    }
     /// What the add-by-address dialog's last *Find* found so far.
     fn probe(&self) -> Probe;
     /// A speaker's tone, for the tone dialog.
@@ -539,7 +545,7 @@ pub enum CodeStage {
     Wrong,
     /// The time ran out.
     TimedOut,
-    /// The TV didn’t show a code.
+    /// Asking the TV to show a code didn’t work.
     NoAnswer,
 }
 

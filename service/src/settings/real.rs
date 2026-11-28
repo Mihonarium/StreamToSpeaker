@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::{App, UpdateOutcome};
 use crate::delay::Kind;
@@ -134,6 +134,12 @@ pub fn seen_at(unix: u64, now_unix: u64, offset: i64) -> Seen {
 /// speaker of the second kind may play without ever reaching this PC.
 pub fn says_not_reached(reached: Option<crate::airplay::Reached>, public: bool) -> bool {
     matches!(reached, Some(crate::airplay::Reached::No { silent }) if silent || public)
+}
+
+/// The whole seconds left until `until`, rounded up: what a countdown
+/// shows.
+pub fn seconds_until(until: Instant) -> u32 {
+    until.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000) as u32
 }
 
 /// The day `unix` fell on, in the zone `offset` seconds from UTC, unless
@@ -600,7 +606,7 @@ impl SettingsPort for AppSettings {
             failed,
             appears_as: app.sendspin_source_name(),
             found_by,
-            code: app.sendspin_source_code().map(|(code, _)| (code, None)),
+            code: app.sendspin_source_code().map(|(code, _, until)| (code, Some(seconds_until(until)))),
             paired_with: app.sendspin_paired_servers(),
             played,
             paused: app.is_sendspin_pairing_paused(),
@@ -843,6 +849,10 @@ impl SettingsPort for AppSettings {
         DiscoveryCheck { lines }
     }
 
+    fn password_once(&self, id: &str) -> bool {
+        self.app.password_dialog(id, "").one_session
+    }
+
     fn wanted_dialog(&self) -> Option<Wanted> {
         let app = &self.app;
         if let Some(mut ask) = app.pairing_code_ask() {
@@ -854,15 +864,15 @@ impl SettingsPort for AppSettings {
                 id: p.id,
                 name: clean_name(&p.name).0,
                 live_code: p.kind != PairPromptKind::TokenOnly,
-                seconds_left: None,
+                seconds_left: p.until.map(seconds_until),
                 identity_changed: p.identity_changed,
                 lost: p.lost_credential,
                 wrong: false,
             }));
         }
-        if let Some((code, _)) = app.sendspin_source_code() {
+        if let Some((code, _, until)) = app.sendspin_source_code() {
             if self.inner.lock().unwrap().ma_code_closed.as_deref() != Some(code.as_str()) {
-                return Some(Wanted::MaCode(MaCodeShow { code, this_pc: app.sendspin_source_name(), seconds_left: None }));
+                return Some(Wanted::MaCode(MaCodeShow { code, this_pc: app.sendspin_source_name(), seconds_left: Some(seconds_until(until)) }));
             }
         }
         None
@@ -1052,7 +1062,7 @@ impl SettingsPort for AppSettings {
                 }
             }
             Act::CancelMaPairing => {
-                self.inner.lock().unwrap().ma_code_closed = app.sendspin_source_code().map(|(c, _)| c);
+                self.inner.lock().unwrap().ma_code_closed = app.sendspin_source_code().map(|(c, ..)| c);
             }
             Act::OnlyPlaying(on) => app.set_privacy_mode(on),
             Act::Phone(on) => {

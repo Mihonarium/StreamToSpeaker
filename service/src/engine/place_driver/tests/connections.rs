@@ -169,6 +169,47 @@ fn replacing_a_session_on_the_same_renderer_only_unsubscribes_the_old_one() {
     assert!(!after.iter().any(|q| q.soap_action() == Some("Stop")));
 }
 
+/// Den plays, and a pick of Office, a room grouped under Den, is superseded
+/// once its Play has reached Den: Den's own session stays, and no Stop
+/// follows that Play.
+#[test]
+fn a_superseded_connect_to_a_room_of_the_playing_group_leaves_it_playing() {
+    let plays = Arc::new(AtomicU64::new(0));
+    let counted = plays.clone();
+    let fake = FakeRenderer::start(move |q| {
+        if q.soap_action() == Some("Play") {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        answer(q)
+    });
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.pick();
+    r.settle();
+    let topology = format!(r#"<ZoneGroups><ZoneGroup Coordinator="fake-den">
+        <ZoneGroupMember UUID="fake-den" ZoneName="Den" Location="{}"/>
+        <ZoneGroupMember UUID="fake-office" ZoneName="Office"/></ZoneGroup></ZoneGroups>"#, fake.url("/description.xml"));
+    let room = FakeRenderer::start(move |q| match q.soap_action() {
+        Some("GetZoneGroupState") => Reply::soap_ok("urn:schemas-upnp-org:service:ZoneGroupTopology:1",
+            "GetZoneGroupState", &[("ZoneGroupState", &topology)]),
+        None if q.method == "GET" => Reply::ok(&renderer_description("Office", &["ZoneGroupTopology"])),
+        _ => answer(q),
+    });
+    let office = r.app.add_manual_speaker(crate::manual_speakers::ManualKind::Upnp, "Office", &room.url("/description.xml"), "").unwrap();
+    assert_eq!(plays.load(Ordering::SeqCst), 1);
+    let before = fake.requests().len();
+    let superseded = {
+        let _job = crate::engine::cancel::enter(Arc::new(move || plays.load(Ordering::SeqCst) >= 2));
+        r.app.engine_connect(&office, true)
+    };
+    assert_eq!(superseded, Err(crate::app::SUPERSEDED.to_string()));
+    assert_eq!(r.driver.bound().unwrap().0, DEN);
+    let requests = fake.requests();
+    let play = requests[before..].iter().position(|q| q.soap_action() == Some("Play")).expect("the connect reached Play");
+    let after = &requests[before + play + 1..];
+    assert!(after.iter().any(|q| q.method == "UNSUBSCRIBE"));
+    assert!(!after.iter().any(|q| q.soap_action() == Some("Stop")));
+}
+
 #[test]
 fn a_late_stop_cannot_move_windows_after_another_speaker_binds() {
     let (stopping, stopped) = bounded(1);

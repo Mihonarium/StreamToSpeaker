@@ -237,14 +237,15 @@ pub fn client_pairing_psk(ctx: &PairingCtx<'_>) -> Result<PairOutcome> {
 }
 
 /// Client side of the dynamic pairing code flow. `show` is called with
-/// the code to display (and with `None` once the attempt ends).
-pub fn client_dynamic_code(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Option<String>)) -> Result<PairOutcome> {
+/// the code to display and when this attempt ends at the latest (and
+/// with `None` once it has ended).
+pub fn client_dynamic_code(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Option<(String, Instant)>)) -> Result<PairOutcome> {
     let result = client_dynamic_code_inner(ctx, digits, show);
     show(None);
     result
 }
 
-fn client_dynamic_code_inner(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Option<String>)) -> Result<PairOutcome> {
+fn client_dynamic_code_inner(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Option<(String, Instant)>)) -> Result<PairOutcome> {
     let deadline = Instant::now() + CLIENT_ATTEMPT_TIMEOUT;
     let d = ctx.dialect;
     let sid = sid(d, &ctx.handshake_hash, ctx.pairing_index);
@@ -261,7 +262,7 @@ fn client_dynamic_code_inner(ctx: &PairingCtx<'_>, digits: u32, show: &dyn Fn(Op
     let nonce_a = field32(&init, "nonce_A")?;
     let digits = if d == Dialect::Spec { 6 } else { digits };
     let code = derive_code(d, &ctx.handshake_hash, &nonce_a, &nonce_b, digits);
-    show(Some(code.clone()));
+    show(Some((code.clone(), deadline)));
     let mut pake = CPace::start(cpace::Role::Responder, code.as_bytes(), &sid, b"", AD_CLIENT)?;
 
     let auth = match next(ctx, &["server/pair-auth"], deadline)? {
@@ -321,10 +322,10 @@ pub fn server_pairing_psk(ctx: &PairingCtx<'_>) -> Result<PairOutcome> {
     }
 }
 
-/// Server side of a pairing-code flow. `ask_code` blocks until the
-/// operator typed the code (or returns `None` = cancelled); it gets
-/// `true` while the client reported the attempt held back (pending).
-pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn() -> Option<String>) -> Result<PairOutcome> {
+/// Server side of a pairing-code flow. `ask_code` is told when this
+/// attempt ends at the latest and blocks until the operator typed the
+/// code (or returns `None` = cancelled).
+pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn(Instant) -> Option<String>) -> Result<PairOutcome> {
     let deadline = Instant::now() + SERVER_ATTEMPT_TIMEOUT;
     let d = ctx.dialect;
     let sid = sid(d, &ctx.handshake_hash, ctx.pairing_index);
@@ -359,7 +360,7 @@ pub fn server_code(ctx: &PairingCtx<'_>, dynamic: bool, ask_code: &dyn Fn() -> O
     } else {
         (None, None)
     };
-    let Some(code) = ask_code() else {
+    let Some(code) = ask_code(deadline) else {
         return Ok(send_abort(ctx, "user_cancelled"));
     };
     let code: String = code.chars().filter(|c| c.is_ascii_digit()).collect();

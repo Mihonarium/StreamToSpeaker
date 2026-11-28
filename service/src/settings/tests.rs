@@ -175,11 +175,34 @@ fn the_code_goes_in_by_itself_after_the_fourth_digit() {
 }
 
 #[test]
+fn the_password_window_says_whether_the_password_is_saved() {
+    let saved = "Saved on this PC for next time.";
+    let once = "Used for this connection only: another speaker answers with the same identity, so it isn’t saved.";
+    // Opened by the person, from the speaker's page or its row.
+    let h = Harness::dialog(Dialog::Password(PasswordDialog::to_connect("office", "Office")), ScriptedSettings::new());
+    assert!(h.has(saved) && !h.has(once));
+    let port = ScriptedSettings::new();
+    port.set(|s| s.password_once = true);
+    let h = Harness::dialog(Dialog::Password(PasswordDialog::to_connect("office", "Office")), port);
+    assert!(h.has(once) && !h.has(saved));
+}
+
+#[test]
+fn the_real_app_says_when_a_typed_password_is_used_once() {
+    let (app, port, _) = real();
+    let id = with_speaker(&app);
+    assert!(!port.password_once(&id));
+    // An id that names one announcement of two with the same identity:
+    // nothing is saved under it.
+    assert!(port.password_once("airplay:B8E93735AC11/Kitchen 2"));
+}
+
+#[test]
 fn asking_for_a_new_code_after_no_answer_requests_one() {
     let port = ScriptedSettings::new();
     port.set(|s| s.wanted = Some(Wanted::PairingCode(CodeAsk { id: "den".into(), name: "Den TV".into(), stage: CodeStage::NoAnswer, seconds_left: None })));
     let mut h = Harness::dialog(Dialog::Code(CodeDialog::new("den")), port);
-    assert!(h.has("Den TV didn’t show a code."));
+    assert!(h.has("Asking Den TV to show a code didn’t work."));
     h.click("Ask for a new code");
     assert_eq!(h.acts(), vec![Act::NewCode("den".into())]);
 }
@@ -581,6 +604,30 @@ fn values_from_an_earlier_version_are_carried_over_not_lab_settings() {
     port.act(Act::Lab(LabAct::ResetCarriedOver));
     assert!(port.lab().carried_over.is_none());
     assert_eq!(app.user_config.lock().unwrap().airplay_latency_ms, 2000);
+}
+
+#[test]
+fn music_assistants_code_says_how_long_it_stays() {
+    use std::time::{Duration, Instant};
+    let (app, port, _desk) = real();
+    app.set_sendspin_source_enabled(true).unwrap();
+    assert_eq!(port.music_assistant().code, None);
+    let code = |ends: Instant| Some(("482917".to_string(), "Music Assistant".to_string(), ends));
+    app.set_sendspin_source_code(code(Instant::now() + Duration::from_secs(90)));
+    // The page and the window count the same seconds down.
+    let (shown, left) = port.music_assistant().code.expect("a code is on display");
+    assert_eq!(shown, "482917");
+    assert!(matches!(left, Some(88..=90)), "{left:?}");
+    match port.wanted_dialog() {
+        Some(Wanted::MaCode(show)) => assert!(show.code == "482917" && matches!(show.seconds_left, Some(88..=90)), "{show:?}"),
+        other => panic!("{other:?}"),
+    }
+    // An attempt that is over has nothing left.
+    app.set_sendspin_source_code(code(Instant::now()));
+    assert_eq!(port.music_assistant().code, Some(("482917".to_string(), Some(0))));
+    app.set_sendspin_source_code(None);
+    assert_eq!(port.music_assistant().code, None);
+    app.set_sendspin_source_enabled(false).unwrap();
 }
 
 #[test]

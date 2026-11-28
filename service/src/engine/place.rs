@@ -808,6 +808,23 @@ impl Core {
                 }
                 self.ways.insert(speaker.clone(), *way);
                 out.push(Do::Save);
+                // A question that stands about a switch to that speaker is
+                // answered for a switch by the new way.
+                if let Some(c) = &mut self.confirm {
+                    if let Confirm::Busy { speaker: k, way: held, .. }
+                    | Confirm::MayBeInUse { speaker: k, way: held }
+                    | Confirm::ScreenReader { speaker: k, way: held } = &mut c.what
+                    {
+                        if *k == *speaker {
+                            *held = *way;
+                        }
+                    }
+                }
+                // A switch on its way to that speaker goes on by the new
+                // way: getting ready by the old one would keep the old one.
+                if let Some(s) = self.switch.clone().filter(|s| &s.speaker == speaker && s.way != *way) {
+                    return self.switch_request_from_list(s.speaker, Some(*way), s.by, who, false, s.windows_prev, w, now, out);
+                }
                 Ok(Effect::Done)
             }
             Command::PlayChime { speaker, confirmed } => self.chime_request(speaker.clone(), *confirmed, SwitchBy::Switch, who, w, now, out),
