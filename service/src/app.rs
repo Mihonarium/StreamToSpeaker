@@ -1961,15 +1961,15 @@ impl App {
         self.stream_gate.is_granted(peer)
     }
 
-    /// The stream gate for `/stream.raw`, called per request (and once a
-    /// second per open stream) from the HTTP threads, which tell the
-    /// refused device and the log why. Touches only the gate's own brief
-    /// lock — never `session`, which other threads hold across
-    /// multi-second SOAP calls — so a stalled speaker can't park the HTTP
-    /// accept loop. A privacy-mode refusal is surfaced to the user,
-    /// rate-limited per address, naming the device when discovery knows
-    /// it. One while streaming is disabled is only logged: closing the
-    /// stream is what Disable is for.
+    /// The stream gate for a request for `/stream.raw`, called from the
+    /// HTTP threads, which tell the refused device and the log why. An
+    /// admitted request touches only the gate's own brief lock. A
+    /// privacy-mode refusal is noted for the pages with the speaker the
+    /// app was connected to (read under `session`, which other threads
+    /// hold across multi-second SOAP calls: the refused device's answer
+    /// can wait that long) and put in the log, rate-limited per address,
+    /// naming the device when discovery knows it. One while streaming is
+    /// disabled is only logged: closing the stream is what Disable is for.
     pub fn check_stream_client(&self, peer: IpAddr) -> Result<(), Refusal> {
         let verdict = self.stream_gate.check(peer);
         if verdict == Err(Refusal::NotGranted) {
@@ -1983,6 +1983,16 @@ impl App {
             ));
         }
         verdict
+    }
+
+    /// The stream gate for a stream that is already open, asked once a
+    /// second from its HTTP thread: one the gate stops admitting (the
+    /// sound moved to another place, streaming was disabled) is cut.
+    /// Touches only the gate's own brief lock, so the cut never waits on
+    /// a switch in progress. Nothing is noted: a speaker whose stream
+    /// outlived its turn didn't ask for the sound and get refused.
+    pub fn check_open_stream(&self, peer: IpAddr) -> Result<(), Refusal> {
+        self.stream_gate.check(peer)
     }
 
     /// "Kitchen (192.168.1.50)" when discovery knows the address, else
@@ -7842,6 +7852,25 @@ mod tests {
         app.connect_unless_user_picked("sendspin:kitchen", seen);
         assert_eq!(app.connecting_to(), None);
         assert_eq!(app.current_error(), None);
+    }
+
+    #[test]
+    fn a_stream_cut_when_the_sound_moves_on_is_not_a_refused_device() {
+        let app = test_app();
+        let peer = ip("192.168.1.34");
+        let grant = app.stream_gate.grant([peer]);
+        assert_eq!(app.check_stream_client(peer), Ok(()));
+        assert_eq!(app.check_open_stream(peer), Ok(()));
+        // The sound moved elsewhere: the stream that is still open is cut,
+        // and its speaker isn't listed as a device that asked and was
+        // refused.
+        drop(grant);
+        assert_eq!(app.check_open_stream(peer), Err(Refusal::NotGranted));
+        assert!(app.recently_refused().is_empty());
+        assert_eq!(app.current_error(), None);
+        // A device that asks afresh is.
+        assert_eq!(app.check_stream_client(peer), Err(Refusal::NotGranted));
+        assert_eq!(app.recently_refused().len(), 1);
     }
 
     #[test]

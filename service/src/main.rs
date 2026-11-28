@@ -1004,6 +1004,10 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         let app2 = app.clone();
         Arc::new(move |ip| app2.check_stream_client(ip))
     };
+    let stream_goes_on: StreamClientAllowedCallback = {
+        let app2 = app.clone();
+        Arc::new(move |ip| app2.check_open_stream(ip))
+    };
 
     start_http_server(HttpServerConfig {
         bind: app.config.bind,
@@ -1015,6 +1019,7 @@ fn start_http(app: &Arc<App>) -> Result<u16> {
         latency_adjust: Some(latency_adjust),
         web_access: Some(app.web_access.clone()),
         stream_client_allowed: Some(stream_client_allowed),
+        stream_goes_on: Some(stream_goes_on),
         // Host names besides this PC's own addresses, which are always
         // accepted: an --advertise-ip that names a proxy in front of it.
         extra_hosts: app.config.advertise_ip.iter().map(|ip| ip.to_string()).collect(),

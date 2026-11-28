@@ -85,7 +85,8 @@ pub type LatencyAdjustCallback = Arc<dyn Fn(i32) -> i64 + Send + Sync>;
 /// Callback deciding whether a client IP may fetch the stream (the
 /// stream gate: streaming enabled, privacy mode), and if not, why: the
 /// refused device and the log are told which rule it was. Consulted per
-/// request and once a second per open stream, so the user can disable
+/// request, and once a second per open stream (see
+/// [`HttpServerConfig::stream_goes_on`]), so the user can disable
 /// streaming, flip the setting or switch speakers without re-binding the
 /// socket.
 pub type StreamClientAllowedCallback =
@@ -333,6 +334,12 @@ pub struct HttpServerConfig {
     /// client's IP — the stream gate. `None` ⇒ the stream is served to
     /// anyone who connects.
     pub stream_client_allowed: Option<StreamClientAllowedCallback>,
+    /// The same question for a stream that is already open, asked once a
+    /// second: one the gate stops admitting is cut. Kept apart from
+    /// [`stream_client_allowed`](Self::stream_client_allowed) so the app
+    /// can tell a device that asks for the sound from a speaker whose
+    /// stream outlived its turn. `None` ⇒ `stream_client_allowed` is asked.
+    pub stream_goes_on: Option<StreamClientAllowedCallback>,
     /// Host names / addresses accepted in the `Host` header on top of
     /// `localhost`, this machine's name, the bound address and every
     /// address assigned to this machine — e.g. an `--advertise-ip` that
@@ -360,6 +367,7 @@ impl HttpServerConfig {
             latency_adjust: None,
             web_access: None,
             stream_client_allowed: None,
+            stream_goes_on: None,
             extra_hosts: Vec::new(),
             speaker_peer: None,
             catch_up: None,
@@ -442,6 +450,7 @@ pub(crate) fn serve_on(
         latency_adjust: cfg.latency_adjust,
         web_access: cfg.web_access,
         stream_client_allowed: cfg.stream_client_allowed,
+        stream_goes_on: cfg.stream_goes_on,
         speaker_peer: cfg.speaker_peer,
         catch_up: cfg.catch_up,
         notify_lock: Mutex::new(()),
@@ -465,6 +474,7 @@ struct Ctx {
     latency_adjust: Option<LatencyAdjustCallback>,
     web_access: Option<Arc<WebAccess>>,
     stream_client_allowed: Option<StreamClientAllowedCallback>,
+    stream_goes_on: Option<StreamClientAllowedCallback>,
     speaker_peer: Option<SpeakerPeerCallback>,
     catch_up: Option<Arc<crate::delay::catch_up::CatchUp>>,
     hosts: HostPolicy,
@@ -931,7 +941,7 @@ impl Ctx {
         // so a listener that stops being allowed (streaming disabled,
         // speaker switched, privacy turned on) is cut within a second even
         // if no explicit prune ran.
-        let recheck = self.stream_client_allowed.clone().map(|cb| (cb, peer));
+        let recheck = self.stream_goes_on.clone().or_else(|| self.stream_client_allowed.clone()).map(|cb| (cb, peer));
         let mut reader = StreamReader::new(rx, recheck, profile);
         reader.speaker = speaker;
 
@@ -2571,6 +2581,48 @@ mod tests {
         s.write_all(b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
         let n = s.read(&mut buf).unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn an_open_stream_is_rechecked_by_its_own_callback() {
+        // A request and the re-check of a stream that is already open ask
+        // separately, so the app can note only a device that asked.
+        let hub = StreamHub::new();
+        let asked = Arc::new(AtomicU8::new(0));
+        let open = Arc::new(AtomicBool::new(true));
+        let (a, o) = (asked.clone(), open.clone());
+        let mut cfg = HttpServerConfig::minimal("127.0.0.1:0".parse().unwrap(), hub.clone());
+        cfg.stream_client_allowed = Some(Arc::new(move |_| {
+            a.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        cfg.stream_goes_on = Some(Arc::new(move |_| if o.load(Ordering::Acquire) { Ok(()) } else { Err(Refusal::NotGranted) }));
+        let port = start(cfg);
+        let h = hub.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                h.publish(PcmFrame(Arc::new(vec![1u8; 256])));
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut s = connect(port);
+        s.write_all(b"GET /stream.raw HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"));
+        open.store(false, Ordering::Release);
+        let closed_at = Instant::now();
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => assert!(closed_at.elapsed() < Duration::from_secs(4), "still streaming"),
+                Err(e) => panic!("stream didn't end: {e}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(asked.load(Ordering::Acquire), 1, "the request asked once; the open stream asked the other callback");
     }
 
     #[test]
