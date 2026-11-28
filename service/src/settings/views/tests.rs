@@ -877,6 +877,43 @@ fn cant_hear_says_when_windows_treats_the_speakers_network_as_public() {
 }
 
 #[test]
+fn cant_hear_says_when_an_airplay_speaker_hasnt_reached_this_pc() {
+    let cant_tell = |not_reached: bool, network: Option<&str>| {
+        let network = network.map(String::from);
+        scripted(move |s| {
+            s.playback.taking = Some(Ok(Taking::CantTell));
+            s.playback.not_reached = not_reached;
+            s.playback.public_network = network;
+        })
+    };
+    // On a network Windows treats as public: what the search check says
+    // of the network, why it matters here, and the way to Windows'
+    // settings. The page doesn't go on to say that all looks right.
+    let port = cant_tell(true, Some("HomeNet"));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("This PC can’t tell whether Kitchen is playing.") && h.has("Try Kitchen again"));
+    assert!(h.has("Windows treats “HomeNet” as a public network."));
+    assert!(h.shows("Kitchen hasn’t reached this PC since it was connected, which AirPlay speakers usually need to do before they play."));
+    assert!(h.shows("On a public network, Windows Firewall may be stopping it.") && h.shows("then try Kitchen again."));
+    assert!(!h.shows("Everything this PC can check looks right."));
+    h.click("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    assert_eq!(h.acts(), vec![]);
+    // On any other network, of a speaker that stays silent until it has
+    // reached this PC: the finding, with no network to send people to.
+    let port = cant_tell(true, None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen hasn’t reached this PC since it was connected."));
+    assert!(h.shows("AirPlay speakers usually have to reach the PC before they play. A firewall on this PC may be stopping it."));
+    assert!(!h.shows("public network") && !h.has("Open network settings") && !h.shows("Everything this PC can check looks right."));
+    // A speaker that has reached this PC: the page says nothing of it,
+    // on a public network either.
+    let port = cant_tell(false, None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(!h.shows("hasn’t reached this PC") && h.shows("Everything this PC can check looks right."));
+}
+
+#[test]
 fn cant_hear_says_which_device_privacy_turned_away_and_allows_nothing() {
     let away = |device: Option<&str>| {
         let device = device.map(String::from);
@@ -1167,6 +1204,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     a_busy_chime_asks_in_the_page_before_playing();
     the_discovery_check_explains_why_search_is_off();
     cant_hear_says_which_device_privacy_turned_away_and_allows_nothing();
+    cant_hear_says_when_an_airplay_speaker_hasnt_reached_this_pc();
     cant_hear_says_why_the_sound_stayed_on_this_pc();
     tone_name_and_speaker_commands();
     the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();

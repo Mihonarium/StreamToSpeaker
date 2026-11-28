@@ -275,6 +275,16 @@ impl ActiveSession {
         }
     }
 
+    /// What an AirPlay session knows of its speaker reaching this PC;
+    /// `None` for the other kinds of session.
+    pub fn reached(&self) -> Option<crate::airplay::Reached> {
+        match self {
+            ActiveSession::AirPlay(s) => Some(s.reached()),
+            ActiveSession::AirPlay2(s) => Some(s.reached()),
+            ActiveSession::Upnp(_) | ActiveSession::Sendspin(_) | ActiveSession::MusicAssistant(_) => None,
+        }
+    }
+
     /// The final fault reported by AirPlay 2. If authentication failed,
     /// the engine treats the receiver as asking for its code. For other
     /// faults it retries while sound is playing.
@@ -528,6 +538,10 @@ fn run_speaker_control(
 const QUIT_CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How long quitting waits for the speaker to answer its Stop or TEARDOWN.
 const QUIT_TEARDOWN_WAIT: Duration = Duration::from_secs(2);
+/// How long an AirPlay speaker has to reach this PC before the app says it
+/// hasn't. Speakers ask for the time every few seconds; the AirPlay 2
+/// clock's own log says so of a silent one after 5 s.
+const REACH_WAIT: Duration = Duration::from_secs(6);
 
 /// What [`App::take_stream_off_number`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2446,6 +2460,18 @@ impl App {
     /// lets it go or connects again.
     pub fn selected_session_dead(&self) -> bool {
         self.session.lock().unwrap().as_ref().is_some_and(|s| s.is_dead())
+    }
+
+    /// What the bound AirPlay session knows of its speaker reaching this
+    /// PC, once the session is old enough for the speaker to have done so.
+    pub(crate) fn speaker_reached_this_pc(&self) -> Option<crate::airplay::Reached> {
+        let (id, reached) = {
+            let guard = self.session.lock().unwrap();
+            let session = guard.as_ref()?;
+            (session.stable_id(), session.reached()?)
+        };
+        let old_enough = self.session_started.lock().unwrap().as_ref().is_some_and(|(of, at)| *of == id && at.elapsed() >= REACH_WAIT);
+        old_enough.then_some(reached)
     }
 
     /// True if any speaker (any transport) is currently bound.

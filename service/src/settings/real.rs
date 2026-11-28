@@ -128,6 +128,14 @@ pub fn seen_at(unix: u64, now_unix: u64, offset: i64) -> Seen {
     }
 }
 
+/// Whether the check says that an AirPlay speaker hasn't reached this PC:
+/// of a speaker that stays silent until it has, and of any other on a
+/// network Windows treats as public, where Windows Firewall may be why. A
+/// speaker of the second kind may play without ever reaching this PC.
+pub fn says_not_reached(reached: Option<crate::airplay::Reached>, public: bool) -> bool {
+    matches!(reached, Some(crate::airplay::Reached::No { silent }) if silent || public)
+}
+
 /// The day `unix` fell on, in the zone `offset` seconds from UTC, unless
 /// that is `now_unix`'s own day.
 pub fn earlier_day(unix: u64, now_unix: u64, offset: i64) -> Option<Date> {
@@ -706,6 +714,7 @@ impl SettingsPort for AppSettings {
             taking: None,
             turned_away: None,
             public_network: None,
+            not_reached: false,
             volume: None,
             untested: false,
             apple_tv: false,
@@ -792,7 +801,20 @@ impl SettingsPort for AppSettings {
                     Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
                 }
             }
-            Some(Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair) => Ok(Taking::CantTell),
+            Some(Kind::AirPlay { .. } | Kind::HomePod { .. } | Kind::HomePodPair) => {
+                // An AirPlay speaker keeps time with this PC and has to
+                // reach it for that. Whether one that hasn't plays, the
+                // app still can't tell.
+                let reached = app.speaker_reached_this_pc();
+                if matches!(reached, Some(crate::airplay::Reached::No { .. })) {
+                    let public = self.public_network_toward_speaker();
+                    if says_not_reached(reached, public.is_some()) {
+                        c.not_reached = true;
+                        c.public_network = public;
+                    }
+                }
+                Ok(Taking::CantTell)
+            }
             // Music Assistant's server is connected and hasn't started this
             // PC's sound: the panel's note says the same.
             _ if scene.situation.standing.contains(&Standing::MusicAssistantNotStarted) => Err(Taking::NotAsking { two_ways: false }),

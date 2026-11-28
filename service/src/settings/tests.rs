@@ -905,6 +905,27 @@ fn the_playback_check_follows_music_assistants_server() {
 }
 
 #[test]
+fn the_playback_check_says_not_reached_only_where_it_means_something() {
+    use super::real::says_not_reached;
+    use crate::airplay::Reached;
+    // A speaker that follows this PC's clock stays silent until it has
+    // reached this PC.
+    assert!(says_not_reached(Some(Reached::No { silent: true }), false));
+    assert!(says_not_reached(Some(Reached::No { silent: true }), true));
+    // Any other may play without it: said only where Windows Firewall
+    // may be keeping it out.
+    assert!(says_not_reached(Some(Reached::No { silent: false }), true));
+    assert!(!says_not_reached(Some(Reached::No { silent: false }), false));
+    assert!(!says_not_reached(Some(Reached::Yes), true));
+    // Too early to tell, or not an AirPlay speaker.
+    assert!(!says_not_reached(None, true));
+    // With nothing playing to a speaker, the app has no session to ask.
+    let (app, port, _) = real();
+    assert_eq!(app.speaker_reached_this_pc(), None);
+    assert!(!port.playback_check().not_reached);
+}
+
+#[test]
 fn the_playback_check_reads_the_level_and_mute_the_panel_shows() {
     use crate::model::{facts::Level, samples, view::view, PortCore};
     let (app, settings, _) = real();

@@ -410,10 +410,17 @@ pub struct PlaybackCheck {
     /// says what happened; a device is allowed on the speaker's page.
     pub turned_away: Option<TurnedAway>,
     /// While the speaker isn't asking for the sound and no device was
-    /// turned away: the network this PC reaches the speaker over, where
-    /// Windows treats it as public. Windows Firewall, which the app
-    /// doesn't read, may keep the speaker from reaching this PC there.
+    /// turned away, or while an AirPlay speaker hasn't reached this PC:
+    /// the network this PC reaches the speaker over, where Windows treats
+    /// it as public. Windows Firewall, which the app doesn't read, may
+    /// keep the speaker from reaching this PC there.
     pub public_network: Option<String>,
+    /// While the app can't tell whether an AirPlay speaker plays: the
+    /// speaker hasn't reached this PC since it was connected, which it
+    /// has to do to keep time with it. Said of a speaker known to stay
+    /// silent until it does, and where `public_network` names what may
+    /// be why.
+    pub not_reached: bool,
     pub volume: Link<Volume>,
     /// Routes nobody has tried on real hardware.
     pub untested: bool,

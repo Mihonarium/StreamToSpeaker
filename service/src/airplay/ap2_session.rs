@@ -202,6 +202,9 @@ pub struct AirPlay2Session {
     /// Retransmission counters (realtime stream only; buffered has no
     /// resend path and leaves them at zero).
     resend_stats: Arc<crate::airplay::timing::ResendStats>,
+    /// Set once the receiver has asked this PC for the time (a session
+    /// that keeps time over NTP; the others have `ptp_session`).
+    asked_for_time: Arc<AtomicBool>,
     threads: SessionThreads,
     ptp_session: Option<PtpMaster>,
     /// (next 23-bit seq, next rtptime) for the buffered stream — read at
@@ -435,6 +438,7 @@ impl AirPlay2Session {
         let initial_rtptime = random_initial_rtptime();
         let ssrc = random_ssrc();
         let current_rtptime = Arc::new(AtomicU32::new(initial_rtptime));
+        let asked_for_time = Arc::new(AtomicBool::new(false));
 
         // The control socket carries outbound sync packets and inbound
         // resend requests — clone it so both threads can use it.
@@ -512,6 +516,7 @@ impl AirPlay2Session {
                     timing_socket,
                     stop_flag.clone(),
                     cfg.renderer.friendly_name.clone(),
+                    asked_for_time.clone(),
                 )
                 .context("spawning AP2 timing responder")?;
                 bring_up.threads.timing = Some(timing);
@@ -612,6 +617,7 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
+            asked_for_time,
             threads,
             ptp_session,
             buffered_flush,
@@ -879,6 +885,7 @@ impl AirPlay2Session {
             faults,
             volume,
             resend_stats,
+            asked_for_time: Arc::new(AtomicBool::new(false)),
             threads,
             ptp_session,
             buffered_flush: None,
@@ -892,6 +899,22 @@ impl AirPlay2Session {
     /// receiver). The engine looks at it for a dropout.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    /// Whether the receiver has reached this PC since the session
+    /// started. A receiver that follows this PC's clock answers it, and
+    /// plays nothing until it has; any other asks this PC for the time.
+    pub fn reached(&self) -> crate::airplay::Reached {
+        use crate::airplay::Reached;
+        let (heard, silent) = match &self.ptp_session {
+            Some(ptp) => (ptp.timeline.heard_from_receiver(), true),
+            None => (self.asked_for_time.load(Ordering::Acquire), false),
+        };
+        if heard {
+            Reached::Yes
+        } else {
+            Reached::No { silent }
+        }
     }
 
     /// Whether the session runs the buffered stream, whose delay is its

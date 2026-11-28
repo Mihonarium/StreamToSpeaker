@@ -68,6 +68,8 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-trying", 640.0, cant_hear_trying),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
         s("view-cant-hear-public-network", 860.0, cant_hear_public),
+        s("view-cant-hear-not-reached-public-network", 900.0, cant_hear_not_reached_public),
+        s("view-cant-hear-not-reached", 760.0, cant_hear_not_reached),
         s("view-cant-hear-windows-didnt-switch", 520.0, cant_hear_didnt_switch),
         s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
         s("view-cant-hear-app-elsewhere-playing", 900.0, cant_hear_app_while_playing),
@@ -510,6 +512,24 @@ fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-not-asking", "kitchen-playing", |s| {
         s.playback.taking = Some(Err(Taking::NotAsking { two_ways: true }));
         s.playback.volume = None;
+    });
+}
+
+/// An AirPlay speaker that hasn't reached this PC, on a network Windows
+/// treats as public.
+fn cant_hear_not_reached_public(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-not-reached-public-network", "kitchen-playing", |s| {
+        s.playback.taking = Some(Ok(Taking::CantTell));
+        s.playback.not_reached = true;
+        s.playback.public_network = Some("HomeNet".into());
+    });
+}
+
+/// A speaker that follows this PC's clock and hasn't reached this PC.
+fn cant_hear_not_reached(ui: &mut Ui, _: &mut Stage) {
+    cant_hear(ui, "cant-hear-not-reached", "kitchen-playing", |s| {
+        s.playback.taking = Some(Ok(Taking::CantTell));
+        s.playback.not_reached = true;
     });
 }
 

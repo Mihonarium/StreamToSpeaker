@@ -68,3 +68,14 @@ pub mod untrusted_plist;
 pub use ap2_session::{AirPlay2Session, AirPlay2SessionConfig, Ap2StartError};
 pub use discovery::{AirPlayDiscoveryState, AirPlayRenderer, Transport};
 pub use session::{AirPlaySession, AirPlaySessionConfig};
+
+/// What a session knows of its speaker reaching this PC. An AirPlay
+/// speaker keeps time with the PC it plays from and has to reach it for
+/// that: it asks this PC for the time, or answers this PC's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    Yes,
+    /// Not since the session started. `silent`: the speaker follows this
+    /// PC's clock and plays nothing until it has reached it.
+    No { silent: bool },
+}

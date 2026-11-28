@@ -204,6 +204,9 @@ impl ViewContent for CantHearView {
             };
             match r {
                 Ok(Taking::CantTell) | Err(Taking::CantTell) => {
+                    // A speaker that hasn't reached this PC is a lead to
+                    // follow before the page says that all looks right.
+                    all_good &= !c.not_reached;
                     check_line(ui, Found::Unknown, &w!(lang, SetCheckCantTell, speaker = &speaker), Some(&w!(lang, SetCheckCantTellLine)), |ui| {
                         buttons(ui, |ui| {
                             reconnect(ui, ask);
@@ -213,6 +216,22 @@ impl ViewContent for CantHearView {
                                 }
                             }
                         });
+                        // What the app knows that may be why, under the
+                        // step it belongs to: an AirPlay speaker keeps
+                        // time with this PC and has to reach it for that.
+                        if c.not_reached {
+                            ui.add_space(8.0);
+                            match &c.public_network {
+                                Some(network) => {
+                                    check_line(ui, Found::Warning, &w!(lang, SetFindPublic, network = network), Some(&w!(lang, SetCheckPublicAirPlayLine, speaker = &speaker)), |ui| {
+                                        if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
+                                            ask(Ask::Open(crate::model::command::Open::NetworkSettings));
+                                        }
+                                    });
+                                }
+                                None => check_line(ui, Found::Warning, &w!(lang, SetCheckNotReached, speaker = &speaker), Some(&w!(lang, SetCheckNotReachedLine)), |_| ()),
+                            }
+                        }
                     });
                 }
                 Ok(_) => check_line(ui, Found::Good, &w!(lang, SetCheckTaking, speaker = &speaker), None, |_| ()),
