@@ -634,6 +634,91 @@ fn the_real_app_lists_refused_devices_and_allows_one() {
 }
 
 #[test]
+fn the_search_check_names_each_network_and_what_windows_treats_it_as() {
+    use super::real::find_lines;
+    use crate::discovery_net::{NetAdapter, Resolved};
+    use crate::model::facts::NetworkSeen;
+    use crate::model::situation::ConnKind;
+    let adapter = |n: u8, name: &str, ip: &str| NetAdapter { key: format!("{{0A1B2C3D-0000-0000-0000-00000000000{n}}}"), name: name.into(), ipv4: vec![ip.parse().unwrap()] };
+    let adapters = [adapter(1, "Wi-Fi", "192.168.1.23"), adapter(2, "Ethernet 2", "10.0.0.5"), adapter(3, "Corp VPN", "10.8.0.2")];
+    // Windows writes an adapter's id without braces, in either case.
+    let seen = |id: &str, name: &str, private, kind| NetworkSeen { adapter: Some(id.into()), name: Some(name.into()), private, kind };
+    let networks = [
+        seen("0a1b2c3d-0000-0000-0000-000000000001", "HomeNet", Some(true), ConnKind::WiFi),
+        seen("0A1B2C3D-0000-0000-0000-000000000002", "Ethernet 2", Some(false), ConnKind::Wired),
+        seen("0A1B2C3D-0000-0000-0000-000000000003", "corp.example", Some(false), ConnKind::Other),
+    ];
+    let place = |adapter: &str, network: Option<&str>, address: &str| NetworkPlace { adapter: adapter.into(), network: network.map(String::from), address: address.into() };
+    let wifi = Adapter { key: adapters[0].key.clone(), name: "Wi-Fi".into() };
+    assert_eq!(
+        find_lines(&Resolved::All, &adapters, &networks, 4),
+        [
+            FindLine::LookingOn { place: place("Wi-Fi", Some("HomeNet"), "192.168.1.x"), found: 4 },
+            // A network Windows named after its adapter goes by one name.
+            FindLine::LookingOn { place: place("Ethernet 2", None, "10.0.0.x"), found: 0 },
+            // A VPN goes by its adapter's name, and what Windows treats it
+            // as is no finding about the network the speakers are on.
+            FindLine::Vpn { vpn: place("Corp VPN", None, "10.8.0.x"), only: wifi },
+            FindLine::Profile { network: "HomeNet".into(), private: true },
+            FindLine::Profile { network: "Ethernet 2".into(), private: false },
+        ]
+    );
+    // One adapter chosen: its network alone.
+    let chosen = Resolved::Active { name: "Ethernet 2".into(), ip: "10.0.0.5".parse().unwrap() };
+    assert_eq!(
+        find_lines(&chosen, &adapters, &networks, 1),
+        [FindLine::LookingOn { place: place("Ethernet 2", None, "10.0.0.x"), found: 1 }, FindLine::Profile { network: "Ethernet 2".into(), private: false }]
+    );
+    // Where Windows doesn't say what it treats a network as (a domain's
+    // network), or says nothing of the adapter, no finding is made up.
+    let quiet = [NetworkSeen { private: None, ..networks[0].clone() }];
+    assert_eq!(
+        find_lines(&Resolved::All, &adapters[..2], &quiet, 0),
+        [
+            FindLine::LookingOn { place: place("Wi-Fi", Some("HomeNet"), "192.168.1.x"), found: 0 },
+            FindLine::LookingOn { place: place("Ethernet 2", None, "10.0.0.x"), found: 0 },
+        ]
+    );
+    // A network without a name goes by its adapter's.
+    let unnamed = [NetworkSeen { name: None, private: Some(false), ..networks[0].clone() }];
+    assert_eq!(
+        find_lines(&Resolved::All, &adapters[..1], &unnamed, 0),
+        [FindLine::LookingOn { place: place("Wi-Fi", None, "192.168.1.x"), found: 0 }, FindLine::Profile { network: "Wi-Fi".into(), private: false }]
+    );
+    assert_eq!(find_lines(&Resolved::Paused { name: "Wi-Fi".into() }, &adapters, &networks, 0), [FindLine::AdapterOff { adapter: "Wi-Fi".into() }]);
+}
+
+#[test]
+fn the_search_check_reads_the_networks_the_panel_knows() {
+    use crate::discovery_net::NetAdapter;
+    use crate::model::facts::NetworkSeen;
+    use crate::model::situation::ConnKind;
+    use crate::model::{samples, view::view, PortCore};
+    let (app, settings, _) = real();
+    app.set_network_adapters(vec![NetAdapter {
+        key: "{0A1B2C3D-0000-0000-0000-000000000001}".into(),
+        name: "Wi-Fi".into(),
+        ipv4: vec!["192.168.1.23".parse().unwrap()],
+    }]);
+    let looking = |network: Option<&str>| FindLine::LookingOn {
+        place: NetworkPlace { adapter: "Wi-Fi".into(), network: network.map(String::from), address: "192.168.1.x".into() },
+        found: 0,
+    };
+    // Before the panel's state is there, the adapter alone is named.
+    assert_eq!(settings.discovery_check().lines, [looking(None)]);
+    let mut scene = samples::named("kitchen-playing");
+    scene.networks = vec![NetworkSeen {
+        adapter: Some("0A1B2C3D-0000-0000-0000-000000000001".into()),
+        name: Some("HomeNet".into()),
+        private: Some(false),
+        kind: ConnKind::WiFi,
+    }];
+    let port = Arc::new(PortCore::new(view(scene, None, false, 1)));
+    app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    assert_eq!(settings.discovery_check().lines, [looking(Some("HomeNet")), FindLine::Profile { network: "HomeNet".into(), private: false }]);
+}
+
+#[test]
 fn the_playback_check_names_the_place_before_its_session_starts() {
     use crate::model::{samples, view::view, PortCore};
     let (app, settings, _) = real();

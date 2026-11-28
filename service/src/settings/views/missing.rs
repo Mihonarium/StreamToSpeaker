@@ -344,7 +344,7 @@ impl ViewContent for CheckView {
         ViewBar { title: w!(self.port.lang(), SetCheckStepByStep), ..Default::default() }
     }
 
-    fn show(&mut self, ui: &mut Ui, snap: &Snapshot, _ask: &mut dyn FnMut(Ask)) {
+    fn show(&mut self, ui: &mut Ui, snap: &Snapshot, ask: &mut dyn FnMut(Ask)) {
         let lang = self.port.lang();
         ui.spacing_mut().item_spacing.y = 8.0;
         if snap.scene.search.phase == crate::model::facts::SearchPhase::Off {
@@ -367,17 +367,15 @@ impl ViewContent for CheckView {
                     })
                 }
                 FindLine::Profile { network, private: true } => check_line(ui, Mark2::Good, &w!(lang, SetFindPrivate, network = network), None, |_| ()),
-                FindLine::Profile { network, private: false } => check_line(ui, Mark2::Bad, &w!(lang, SetFindPublic, network = network), None, |ui| {
-                    if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
-                        self.port.act(Act::OpenNetworkSettings);
-                    }
-                }),
-                FindLine::Firewall { open: true } => check_line(ui, Mark2::Good, &w!(lang, SetFindFirewallOpen), None, |_| ()),
-                FindLine::Firewall { open: false } => check_line(ui, Mark2::Bad, &w!(lang, SetFindFirewallBlocks), None, |ui| {
-                    if Button::standard(&w!(lang, SetAllowPrivate)).show(ui).clicked() {
-                        self.port.act(Act::AllowThroughFirewall);
-                    }
-                }),
+                // A caution: the app doesn't read Windows Firewall, which
+                // is stricter on a public network.
+                FindLine::Profile { network, private: false } => {
+                    check_line(ui, Mark2::Warning, &w!(lang, SetFindPublic, network = network), Some(&w!(lang, SetFindPublicLine)), |ui| {
+                        if Button::standard(&w!(lang, SetOpenNetworkSettings)).show(ui).clicked() {
+                            ask(Ask::Open(crate::model::command::Open::NetworkSettings));
+                        }
+                    })
+                }
                 FindLine::AirPlaySearchFailed => check_line(ui, Mark2::Warning, &w!(lang, SetFindAirPlayFailed), None, |_| ()),
                 FindLine::AdapterOff { adapter } => check_line(ui, Mark2::Bad, &w!(lang, SetNotLookingOff, adapter = adapter), None, |ui| {
                     if Button::standard(&w!(lang, SetLookEverywhere)).show(ui).clicked() {

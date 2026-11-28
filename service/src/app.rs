@@ -924,7 +924,10 @@ pub type CommandSink = Box<dyn Fn(crate::model::Surface, crate::model::Command) 
 /// A device that asked for the stream and was refused (privacy mode).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefusedDevice {
+    /// The speaker the app was connected to when the device asked.
     pub speaker: Option<String>,
+    /// The number of that connection's session.
+    pub session: u64,
     pub address: IpAddr,
     /// Its name when discovery knows it, else its address.
     pub name: String,
@@ -4291,6 +4294,12 @@ impl App {
         self.adapters_cache.lock().unwrap().clone()
     }
 
+    /// Sets the adapters the pages list.
+    #[cfg(test)]
+    pub(crate) fn set_network_adapters(&self, adapters: Vec<NetAdapter>) {
+        *self.adapters_cache.lock().unwrap() = adapters;
+    }
+
     pub fn discovery_net_status(&self) -> DiscoveryNetStatus {
         DiscoveryNetStatus {
             scope: self.discovery_scope.lock().unwrap().clone(),
@@ -5627,10 +5636,14 @@ impl App {
     fn note_refused(&self, peer: IpAddr) {
         let peer = canonical_ip(peer);
         let name = self.speaker_name_at(peer).unwrap_or_else(|| peer.to_string());
-        let speaker = self.session.lock().unwrap().as_ref().map(|s| s.stable_id());
+        // A session gets its number under this lock.
+        let (speaker, session) = {
+            let bound = self.session.lock().unwrap();
+            (bound.as_ref().map(|s| s.stable_id()), self.session_number())
+        };
         let mut list = self.refused.lock().unwrap();
         list.retain(|r| r.address != peer);
-        list.insert(0, RefusedDevice { speaker, address: peer, name, at: std::time::SystemTime::now() });
+        list.insert(0, RefusedDevice { speaker, session, address: peer, name, at: std::time::SystemTime::now() });
         list.truncate(REFUSALS_KEPT);
     }
 

@@ -418,10 +418,6 @@ pub type Link<T> = Option<Result<T, T>>;
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowsSends {
     ToUs,
-    /// Windows plays on another output.
-    Elsewhere {
-        output: String,
-    },
     /// An app still plays on another output. Found while the rest goes to
     /// the speaker, it doesn't end the check.
     AppElsewhere {
@@ -439,9 +435,11 @@ pub enum Taking {
     NotAsking {
         two_ways: bool,
     },
-    /// A member of its group asked and was refused.
+    /// Another device asked for the sound during this connection and
+    /// privacy refused it: it may be the one that plays the speaker's
+    /// sound. `device` is its name, where the search knows it.
     Refused {
-        device: String,
+        device: Option<String>,
         address: String,
     },
     /// AirPlay speakers and HomePods don't report it.
@@ -468,10 +466,9 @@ pub enum FindLine {
     LookingOn { place: NetworkPlace, found: usize },
     /// Also connected to a VPN; offer to look only on `only`.
     Vpn { vpn: NetworkPlace, only: Adapter },
-    /// Windows treats the network as private (fine) or public.
+    /// Windows treats the network as private (fine) or public, where its
+    /// firewall may keep speakers from reaching this PC.
     Profile { network: String, private: bool },
-    /// The firewall lets speakers reach this PC, or blocks them.
-    Firewall { open: bool },
     /// AirPlay discovery couldn't start.
     AirPlaySearchFailed,
     /// The chosen adapter is off.
@@ -674,10 +671,7 @@ pub enum Act {
     TrySteady,
     Unmute,
     SetVolume(u8),
-    SendToUs,
     LookOnlyOn(String),
-    OpenNetworkSettings,
-    AllowThroughFirewall,
     OpenApiHelp,
     // About
     DailyUpdateCheck(bool),

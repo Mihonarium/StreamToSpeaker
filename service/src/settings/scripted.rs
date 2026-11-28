@@ -503,7 +503,6 @@ pub fn example() -> State {
                     only: Adapter { key: "wifi".into(), name: "Wi-Fi".into() },
                 },
                 FindLine::Profile { network: "HomeNet".into(), private: true },
-                FindLine::Firewall { open: true },
             ],
         },
         wanted: None,

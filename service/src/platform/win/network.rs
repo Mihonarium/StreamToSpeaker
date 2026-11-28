@@ -58,7 +58,9 @@ mod native {
         CancelMibChangeNotify2, ConvertInterfaceGuidToLuid, GetIfEntry2, NotifyIpInterfaceChange, MIB_IF_ROW2,
         MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
     };
-    use windows::Win32::Networking::NetworkListManager::{INetworkConnection, INetworkListManager, NetworkListManager};
+    use windows::Win32::Networking::NetworkListManager::{
+        INetworkConnection, INetworkListManager, NetworkListManager, NLM_NETWORK_CATEGORY_PRIVATE, NLM_NETWORK_CATEGORY_PUBLIC,
+    };
     use windows::Win32::Networking::WinSock::AF_UNSPEC;
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
@@ -163,11 +165,23 @@ mod native {
             if !connection.IsConnected()?.as_bool() {
                 return Ok(None);
             }
-            let Some(kind) = kind(connection.GetAdapterId()?) else { return Ok(None) };
+            let adapter = connection.GetAdapterId()?;
+            let Some(kind) = kind(adapter) else { return Ok(None) };
             let profile = connection.GetNetwork()?;
             let id = format!("{:?}", profile.GetNetworkId()?);
             let name = profile.GetName().ok().map(|s| s.to_string()).filter(|s| !s.is_empty());
-            Ok(Some((format!("{:?}", connection.GetConnectionId()?), NetConnection { id, name, kind })))
+            // A domain's network is neither private nor public.
+            let private = profile.GetCategory().ok().and_then(|category| {
+                if category == NLM_NETWORK_CATEGORY_PRIVATE {
+                    Some(true)
+                } else if category == NLM_NETWORK_CATEGORY_PUBLIC {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            let adapter = Some(format!("{adapter:?}"));
+            Ok(Some((format!("{:?}", connection.GetConnectionId()?), NetConnection { id, name, kind, adapter, private })))
         }
     }
 
@@ -205,7 +219,9 @@ mod native {
             assert!(platform.network.connections().iter().all(|c| !c.id.is_empty()));
             let _apartment = Apartment::enter().unwrap();
             match read() {
-                Ok(list) => assert!(list.iter().all(|(_, c)| !c.id.is_empty())),
+                // Each comes with its adapter's id, 36 characters of it,
+                // by which the app's list of adapters finds its network.
+                Ok(list) => assert!(list.iter().all(|(_, c)| !c.id.is_empty() && c.adapter.as_deref().is_some_and(|a| a.len() == 36))),
                 Err(e) => eprintln!("Windows network profiles unavailable: {e}"),
             }
         }

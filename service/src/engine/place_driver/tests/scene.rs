@@ -220,7 +220,7 @@ fn music_assistant_follows_the_network_it_connected_on() {
         cfg.speaker_settings.get(crate::sendspin_app::MA_OUTPUT_ID).and_then(|s| s.network.clone())
     };
     let join = |r: &mut Rig, net: &str| {
-        r.windows.connect_to(vec![crate::platform::NetConnection { id: net.into(), name: None, kind: ConnKind::WiFi }]);
+        r.windows.connect_to(vec![crate::platform::NetConnection { id: net.into(), name: None, kind: ConnKind::WiFi, adapter: None, private: None }]);
         r.driver.input(PlaceInput::System(SystemEvent::NetworkChanged));
         r.driver.look();
     };
@@ -332,7 +332,9 @@ fn music_assistant_picked_before_a_server_connects_has_no_network() {
 }
 
 #[test]
-fn windows_outputs_and_network_kind_follow_the_observation() {
+fn windows_outputs_and_networks_follow_the_observation() {
+    use crate::model::facts::NetworkSeen;
+    use crate::platform::fake::HOME_ADAPTER;
     let mut r = Rig::on(App::for_tests());
     r.windows.set_output_on(HEADPHONES, true);
     assert!(!r.driver.scene().outputs_open);
@@ -348,10 +350,18 @@ fn windows_outputs_and_network_kind_follow_the_observation() {
         [output(SPEAKERS), output(HEADPHONES)]
     );
     assert_eq!(scene.network, Some(ConnKind::WiFi));
+    // Each network comes with its name, its adapter and what Windows
+    // treats it as, for the pages that say where the app looks.
+    assert_eq!(
+        scene.networks,
+        [NetworkSeen { adapter: Some(HOME_ADAPTER.into()), name: Some("Home".into()), private: Some(true), kind: ConnKind::WiFi }]
+    );
     let conn = |id: &str, kind| crate::platform::NetConnection {
         id: id.into(),
         name: None,
         kind,
+        adapter: None,
+        private: None,
     };
     r.windows.connect_to(vec![
         conn("wire", ConnKind::Wired),
@@ -363,6 +373,15 @@ fn windows_outputs_and_network_kind_follow_the_observation() {
         conn("two", ConnKind::WiFi),
     ]);
     assert_eq!(r.driver.scene().network, None);
+    let mut cafe = conn("cafe", ConnKind::WiFi);
+    cafe.name = Some("Cafe".into());
+    cafe.adapter = Some("ad-1".into());
+    cafe.private = Some(false);
+    r.windows.connect_to(vec![cafe]);
+    assert_eq!(
+        r.driver.scene().networks,
+        [NetworkSeen { adapter: Some("ad-1".into()), name: Some("Cafe".into()), private: Some(false), kind: ConnKind::WiFi }]
+    );
 }
 
 #[test]

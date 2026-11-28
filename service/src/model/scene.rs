@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use super::facts::{
-    Applies, DelayRange, DelaySteps, PcOutput, Progress, SearchFacts, SpeakerDelay, SpeakerKind,
+    Applies, DelayRange, DelaySteps, NetworkSeen, PcOutput, Progress, SearchFacts, SpeakerDelay, SpeakerKind,
     VolumeFacts,
 };
 use super::situation::{ConnKind, RowState, Situation, Spot, WayChoice};
@@ -31,6 +31,8 @@ pub struct Scene {
     /// The kind of the network the app looks for speakers on; `None` while
     /// there are several or none.
     pub network: Option<ConnKind>,
+    /// This PC's network connections, with the names Windows has for them.
+    pub networks: Vec<NetworkSeen>,
     pub repair: RepairNow,
 }
 

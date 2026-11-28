@@ -202,6 +202,12 @@ pub struct NetConnection {
     /// Its name, where Windows gives one.
     pub name: Option<String>,
     pub kind: ConnKind,
+    /// Windows' id of the adapter the connection is on, where it is known.
+    pub adapter: Option<String>,
+    /// Whether Windows treats the network as private (`true`) or public
+    /// (`false`); `None` where it can't be told or is neither (a domain's
+    /// network).
+    pub private: Option<bool>,
 }
 
 /// This PC's network connections.
@@ -484,7 +490,7 @@ impl PassThrough for Passive {
 /// every speaker that stops answering would be put down to that.
 impl Network for Passive {
     fn connections(&self) -> Vec<NetConnection> {
-        vec![NetConnection { id: "unknown".into(), name: None, kind: ConnKind::Wired }]
+        vec![NetConnection { id: "unknown".into(), name: None, kind: ConnKind::Wired, adapter: None, private: None }]
     }
 }
 

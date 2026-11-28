@@ -616,6 +616,23 @@ fn the_discovery_check_explains_why_search_is_off() {
 }
 
 #[test]
+fn the_discovery_check_cautions_about_a_public_network() {
+    // A private network is said as found, and nothing is said of Windows
+    // Firewall, which the app doesn't read.
+    let port = scripted(|_| ());
+    let h = H::new(port.clone(), Box::new(CheckView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Windows treats “HomeNet” as a private network.") && !h.shows("Firewall"));
+    // A public one is a caution, with the way to Windows' page for it.
+    let port = scripted(|s| s.discovery.lines = vec![FindLine::Profile { network: "HomeNet".into(), private: false }]);
+    let mut h = H::new(port.clone(), Box::new(CheckView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Windows treats “HomeNet” as a public network."));
+    assert!(h.shows("Windows Firewall may keep speakers from reaching this PC.") && h.shows("choose Private."));
+    h.click("Open network settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::NetworkSettings)]);
+    assert!(h.acts().is_empty());
+}
+
+#[test]
 fn speaker_missing_searches_shows_hidden_speakers_and_opens_the_check() {
     let port = scripted(|s| {
         let mut tv = s.speakers.hidden[0].clone();
@@ -748,10 +765,10 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     // An app that stayed on another output while the rest plays on the
     // speaker: a remark with the same ways out, and the check goes on.
     let port = scripted(|s| {
-        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
     });
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-except-an-app"));
-    assert!(h.has("Chrome is still playing on this PC’s Speakers (Realtek Audio). The rest goes to Kitchen."));
+    assert!(h.has("Chrome is still playing on this PC’s Speakers. The rest goes to Kitchen."));
     assert!(h.has("Connected to Kitchen.") && h.has("Kitchen is taking the sound.") && h.shows("32, not muted"));
     assert!(h.shows("This check updates by itself as things change.") && !h.shows("first broken step"), "a remark isn't a broken step");
     assert!(!h.shows("Everything this PC can check looks right."), "something was found");
@@ -761,10 +778,10 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     // which one, and that it isn't the speaker.
     let port = scripted(|s| {
         s.playback.playing = Some(Ok(Some("Chrome".into())));
-        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
     });
     let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
-    assert!(h.has("Chrome is still playing on this PC’s Speakers (Realtek Audio), not on Kitchen."));
+    assert!(h.has("Chrome is still playing on this PC’s Speakers, not on Kitchen."));
     // The two ways out: a restart, named for the app, and Windows' page
     // of apps and their outputs.
     assert!(h.shows("Restart Chrome: some apps move to a new output only after a restart."));
@@ -814,6 +831,49 @@ fn cant_hear_offers_the_one_fix_of_the_first_broken_step() {
     assert!(h.shows("Everything this PC can check looks right."));
     h.click("Play a test chime");
     assert_eq!(h.asks(), vec![Asked::Command(Command::PlayTestSound(crate::model::samples::kitchen()))]);
+}
+
+#[test]
+fn cant_hear_names_a_device_that_was_refused_the_sound() {
+    let refused = |device: Option<&str>| {
+        let device = device.map(String::from);
+        scripted(move |s| {
+            s.playback.taking = Some(Err(Taking::Refused { device, address: "192.168.1.51".into() }));
+            s.playback.volume = None;
+        })
+    };
+    let port = refused(Some("Kitchen Sub"));
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("Kitchen Sub asked for the sound and was refused."));
+    assert!(h.shows("Only Kitchen is allowed to listen. If that device plays together with Kitchen, allow it."));
+    assert!(h.shows("It stops at the first broken step.") && !h.shows("is taking the sound") && !h.shows("volume"));
+    h.click("Allow it");
+    assert_eq!(h.acts(), vec![Act::Allow { address: "192.168.1.51".into(), speaker: "kitchen".into() }]);
+    // A device the search doesn't know goes by its address.
+    let port = refused(None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("kitchen-playing"));
+    assert!(h.has("A device at 192.168.1.51 asked for the sound and was refused.") && h.has("Allow it"));
+}
+
+#[test]
+fn cant_hear_says_why_the_sound_stayed_on_this_pc() {
+    // Windows kept its own output when Kitchen was picked: the panel's
+    // note with the ways out, where the page otherwise says to pick a
+    // speaker.
+    let kitchen = crate::model::samples::kitchen();
+    let mut scene = snap("pc-plain").scene.clone();
+    scene.situation.standing.push(crate::model::situation::Standing::WindowsDidntSwitch { speaker: kitchen.clone() });
+    let port = scripted(|s| s.playback.speaker = None);
+    let mut h = H::new(port.clone(), Box::new(CantHearView::new(port)), Arc::new(crate::model::view::view(scene, None, false, 1)));
+    assert!(h.has("Your sound is on this PC.") && h.has("Windows didn’t switch to Kitchen."));
+    assert!(h.shows("Try again, or choose this app’s output in Windows’ sound settings.") && !h.shows("Pick a speaker in the panel"));
+    h.click("Try Kitchen again");
+    assert_eq!(h.asks(), vec![Asked::Command(Command::Switch { place: crate::model::state::Place::Speaker(kitchen), way: None })]);
+    h.click("Open Windows’ sound settings");
+    assert_eq!(h.asks(), vec![Asked::Open(Open::SoundSettings)]);
+    let port = scripted(|s| s.playback.speaker = None);
+    let h = H::new(port.clone(), Box::new(CantHearView::new(port)), snap("pc-plain"));
+    assert!(h.has("Your sound is on this PC.") && h.shows("Pick a speaker in the panel") && !h.shows("Windows didn’t switch"));
 }
 
 #[test]
@@ -1021,6 +1081,8 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
     reset_and_remove_only_act_after_confirmation();
     a_busy_chime_asks_in_the_page_before_playing();
     the_discovery_check_explains_why_search_is_off();
+    cant_hear_names_a_device_that_was_refused_the_sound();
+    cant_hear_says_why_the_sound_stayed_on_this_pc();
     tone_name_and_speaker_commands();
     the_page_uses_the_panel_delay_commands_and_the_selected_ways_limits();
     // Draw the exact-delay row with a saved change so the reset link is covered too.
@@ -1056,7 +1118,6 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.speakers.networks.as_mut().unwrap().looking = Looking::AdapterOff { adapter: "Wi-Fi".into() };
             s.discovery.lines = vec![
                 FindLine::Profile { network: "HomeNet".into(), private: false },
-                FindLine::Firewall { open: false },
                 FindLine::AirPlaySearchFailed,
                 FindLine::AdapterOff { adapter: "Wi-Fi".into() },
                 FindLine::Failed { adapter: "Wi-Fi".into(), why: "no answer".into() },
@@ -1070,7 +1131,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
             s.speakers.networks.as_mut().unwrap().looking = Looking::Nowhere;
             s.ma.offer = None;
             s.about.updates.state = UpdateState::NeverChecked;
-            s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
+            s.playback.taking = Some(Err(Taking::Refused { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() }));
             s.playback.playing = Some(Ok(Some("Chrome".into())));
             s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
             s.general.shortcuts.as_mut().unwrap().on = true;
@@ -1093,7 +1154,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         },
         |s| {
             s.playback.speaker = None;
-            s.playback.windows = Some(Err(WindowsSends::Elsewhere { output: "Headphones".into() }));
+            s.playback.windows = Some(Err(WindowsSends::InputLost));
             s.playback.connected = Some(Err(()));
             s.about.updates.state = UpdateState::Downloading;
             s.ma.found_by = Some(("Music Assistant (Home)".into(), None));
@@ -1122,7 +1183,7 @@ pub(in crate::settings) fn say_everything() -> Vec<String> {
         |s| s.about.updates.state = UpdateState::DevBuild,
         |s| {
             s.about.updates.state = UpdateState::UpToDate { at: Seen::On(Date { day: 3, month: 1 }) };
-            s.playback.windows = Some(Err(WindowsSends::Elsewhere { output: "Headphones".into() }));
+            s.playback.windows = Some(Err(WindowsSends::InputLost));
             s.ma.found_by = None;
             s.ma.paired_with.clear();
             s.lab.carried_over = Some(CarriedOver { airplay_ms: Some(500), homepod_ms: None, homepod_buffered: false, speakers: vec!["Office".into()] });

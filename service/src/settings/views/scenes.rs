@@ -66,7 +66,7 @@ pub fn scenes() -> Vec<Scene> {
         s("view-cant-hear-connecting", 640.0, cant_hear_connecting),
         s("view-cant-hear-trying", 640.0, cant_hear_trying),
         s("view-cant-hear-not-asking", 760.0, cant_hear_not_asking),
-        s("view-cant-hear-windows-elsewhere", 640.0, cant_hear_windows),
+        s("view-cant-hear-windows-didnt-switch", 520.0, cant_hear_didnt_switch),
         s("view-cant-hear-app-elsewhere", 640.0, cant_hear_app),
         s("view-cant-hear-app-elsewhere-playing", 900.0, cant_hear_app_while_playing),
         s("view-cant-hear-input-lost", 560.0, cant_hear_input_lost),
@@ -499,7 +499,7 @@ fn cant_hear_not_asking(ui: &mut Ui, _: &mut Stage) {
 fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-app", "kitchen-playing", |s| {
         s.playback.playing = Some(Ok(Some("Chrome".into())));
-        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+        s.playback.windows = Some(Err(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
         s.playback.connected = None;
         s.playback.taking = None;
         s.playback.volume = None;
@@ -508,7 +508,7 @@ fn cant_hear_app(ui: &mut Ui, _: &mut Stage) {
 
 fn cant_hear_app_while_playing(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-app-playing", "kitchen-except-an-app", |s| {
-        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers (Realtek Audio)".into() }));
+        s.playback.windows = Some(Ok(WindowsSends::AppElsewhere { app: "Chrome".into(), output: "Speakers".into() }));
     });
 }
 
@@ -539,7 +539,7 @@ fn cant_hear_music_assistant(ui: &mut Ui, _: &mut Stage) {
 
 fn cant_hear_refused(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-refused", "kitchen-playing", |s| {
-        s.playback.taking = Some(Err(Taking::Refused { device: "Kitchen Sub".into(), address: "192.168.1.51".into() }));
+        s.playback.taking = Some(Err(Taking::Refused { device: Some("Kitchen Sub".into()), address: "192.168.1.51".into() }));
         s.playback.volume = None;
     });
 }
@@ -555,13 +555,12 @@ fn cant_hear_zero(ui: &mut Ui, _: &mut Stage) {
     cant_hear(ui, "cant-hear-zero", "kitchen-playing", |s| s.playback.volume = Some(Err(Volume::Zero)));
 }
 
-fn cant_hear_windows(ui: &mut Ui, _: &mut Stage) {
-    cant_hear(ui, "cant-hear-windows", "kitchen-playing", |s| {
-        s.playback.windows = Some(Err(WindowsSends::Elsewhere { output: "Headphones (WH-1000XM4)".into() }));
-        s.playback.connected = None;
-        s.playback.taking = None;
-        s.playback.volume = None;
-    });
+fn cant_hear_didnt_switch(ui: &mut Ui, _: &mut Stage) {
+    let mut scene = snap("pc-plain").scene.clone();
+    let speaker = crate::model::state::SpeakerId::new("kitchen");
+    scene.situation.standing.push(crate::model::situation::Standing::WindowsDidntSwitch { speaker });
+    let mut v = CantHearView::new(port(Names::Usual, |s| s.playback.speaker = None));
+    frame(ui, "cant-hear-didnt-switch", &mut v, &crate::model::view::view(scene, None, false, 1));
 }
 
 fn cant_hear_pc(ui: &mut Ui, _: &mut Stage) {

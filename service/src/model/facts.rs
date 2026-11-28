@@ -1,4 +1,5 @@
 //! Observations shared by the place driver, views and settings.
+use super::situation::ConnKind;
 use super::state::{PcOutputId, SpeakerId};
 /// One of Windows' sound outputs, with Windows' own names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,6 +12,20 @@ pub struct PcOutput {
     /// The device it belongs to, e.g. "Realtek Audio".
     pub device: String,
     pub kind: OutputKind,
+}
+
+/// One of this PC's network connections, as Windows describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkSeen {
+    /// Windows' id of the adapter it is on, where known.
+    pub adapter: Option<String>,
+    /// The network's name: a Wi-Fi network's own, or the one Windows gave
+    /// it.
+    pub name: Option<String>,
+    /// Whether Windows treats it as a private network (`true`) or a public
+    /// one (`false`); `None` where it can't be told or is neither.
+    pub private: Option<bool>,
+    pub kind: ConnKind,
 }
 
 /// What an output is, for its icon.

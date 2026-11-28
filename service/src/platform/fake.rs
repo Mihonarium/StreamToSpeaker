@@ -23,6 +23,8 @@ pub const MONITOR: &str = "monitor";
 pub const OURS: &str = "stream-to-speaker";
 /// The network this PC is on at home.
 pub const HOME_NET: &str = "home-wifi";
+/// The id of the adapter this fake's first network is on.
+pub const HOME_ADAPTER: &str = "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9";
 
 /// What the app asked a player to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,8 +118,13 @@ impl FakePlatform {
         state.levels.insert(id(SPEAKERS), (40, false));
         state.levels.insert(id(HEADPHONES), (24, false));
         state.levels.insert(id(OURS), (100, false));
-        state.connections =
-            vec![NetConnection { id: HOME_NET.into(), name: Some("Home".into()), kind: ConnKind::WiFi }];
+        state.connections = vec![NetConnection {
+            id: HOME_NET.into(),
+            name: Some("Home".into()),
+            kind: ConnKind::WiFi,
+            adapter: Some(HOME_ADAPTER.into()),
+            private: Some(true),
+        }];
         Arc::new(FakePlatform { state: Mutex::new(state), sinks: Mutex::new(Vec::new()) })
     }
 

@@ -84,6 +84,8 @@ pub(super) struct Observation {
     pub ours: Option<PcOutputId>,
     pub outputs: Vec<crate::model::facts::PcOutput>,
     pub airplay: HashMap<String, crate::delay::DelayStatus>,
+    /// This PC's connections with what Windows says of each network.
+    pub networks: Vec<crate::model::facts::NetworkSeen>,
 }
 
 impl PlaceDriver {
@@ -131,13 +133,12 @@ impl PlaceDriver {
         let local_level = binding.as_ref().is_some_and(|(_, _, local)| *local);
         let bound = binding.map(|(id, _, _)| id);
         let bound_place = self.bound_as.as_ref().map(|(_, _, speaker)| speaker);
-        let connections: Vec<_> = self
-            .platform
-            .network
-            .connections()
-            .into_iter()
-            .map(|c| Connection { net: NetId(c.id), name: c.name, kind: c.kind })
+        let seen = self.platform.network.connections();
+        let networks = seen
+            .iter()
+            .map(|c| crate::model::facts::NetworkSeen { adapter: c.adapter.clone(), name: c.name.clone(), private: c.private, kind: c.kind })
             .collect();
+        let connections: Vec<_> = seen.into_iter().map(|c| Connection { net: NetId(c.id), name: c.name, kind: c.kind }).collect();
         let mut airplay = HashMap::new();
         let mut rows = fold(&self.list, |id| {
             let status = app.delay_status_of(id);
@@ -285,7 +286,7 @@ impl PlaceDriver {
             panel_open: self.panel_open,
             music_assistant_playing: ma_playing,
         };
-        Observation { world, players, ours, outputs: enabled, airplay }
+        Observation { world, players, ours, outputs: enabled, airplay, networks }
     }
 }
 

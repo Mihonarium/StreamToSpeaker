@@ -116,6 +116,7 @@ impl PlaceDriver {
             steps: DelaySteps::default(),
             search,
             network,
+            networks: obs.networks,
             repair: self.core.repair_note(w),
         };
         (scene, obs.ours)

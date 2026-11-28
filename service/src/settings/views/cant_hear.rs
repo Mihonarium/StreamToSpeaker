@@ -17,7 +17,7 @@ use crate::ui::theme::size;
 
 use super::parts::{buttons, gap, sentence};
 use crate::settings::port::*;
-use crate::settings::widgets::{check_line, fitting, Found};
+use crate::settings::widgets::{check_line, Found};
 use crate::settings::words::w;
 use crate::settings::SettingsPort;
 use crate::settings::{Dialog, ReportDialog};
@@ -75,7 +75,28 @@ impl ViewContent for CantHearView {
         // A test chime is offered where the place can play one.
         let chimes = id.as_ref().filter(|id| snap.scene.situation.speaker(id).is_some_and(|s| s.can_chime));
         let Some(speaker) = c.speaker.clone() else {
-            check_line(ui, Found::Info, &w!(lang, SetCheckOnPc), Some(&w!(lang, SetCheckOnPcLineView)), |_| ());
+            // Windows kept its own output when a speaker was picked: the
+            // panel's note, with the ways out.
+            let wanted = snap.scene.situation.standing.iter().find_map(|s| match s {
+                Standing::WindowsDidntSwitch { speaker } => Some(speaker.clone()),
+                _ => None,
+            });
+            let Some(wanted) = wanted else {
+                check_line(ui, Found::Info, &w!(lang, SetCheckOnPc), Some(&w!(lang, SetCheckOnPcLineView)), |_| ());
+                return;
+            };
+            let name = snap.scene.speaker_name(&wanted);
+            check_line(ui, Found::Info, &w!(lang, SetCheckOnPc), None, |_| ());
+            check_line(ui, Found::Warning, &w!(lang, SetCheckWindowsDidntSwitch, speaker = &name), Some(&w!(lang, WindowsDidntSwitchLine)), |ui| {
+                buttons(ui, |ui| {
+                    if Button::standard(&w!(lang, TrySpeakerAgain, speaker = &name)).max_width(ui.max_rect().width()).show(ui).clicked() {
+                        ask(Ask::Command(Command::Switch { place: crate::model::state::Place::of_speaker(&wanted), way: None }));
+                    }
+                    if Button::standard(&w!(lang, OpenWindowsSound)).show(ui).clicked() {
+                        ask(Ask::Open(crate::model::command::Open::SoundSettings));
+                    }
+                });
+            });
             return;
         };
         sentence(ui, &w!(lang, SetCheckLead));
@@ -134,16 +155,6 @@ impl ViewContent for CantHearView {
                     check_line(ui, Found::Bad, &w!(lang, SetCheckInputLost), Some(&w!(lang, SetCheckInputLostLine, speaker = &speaker)), |ui| {
                         if Button::standard(&w!(lang, SwitchToPc)).show(ui).clicked() {
                             send(ask, Command::Switch { place: crate::model::state::Place::ThisPc, way: None });
-                        }
-                    });
-                }
-                Err(WindowsSends::Elsewhere { output }) => {
-                    all_good = false;
-                    check_line(ui, Found::Bad, &w!(lang, SetCheckWindowsElsewhere, output = output), None, |ui| {
-                        let long = w!(lang, SetSendTo, speaker = &speaker);
-                        let short = w!(lang, SetSendToThis);
-                        if Button::standard(fitting(ui, &long, &short)).accessible_name(long.clone()).show(ui).clicked() {
-                            self.port.act(Act::SendToUs);
                         }
                     });
                 }
@@ -236,9 +247,17 @@ impl ViewContent for CantHearView {
                 }
                 Err(Taking::Refused { device, address }) => {
                     all_good = false;
-                    check_line(ui, Found::Bad, &w!(lang, SetCheckRefused, device = device, speaker = &speaker), None, |ui| {
+                    // Nothing fetches the sound, and another device that
+                    // asked was turned away: it may be the one that plays
+                    // the speaker's sound.
+                    let title = match device {
+                        Some(device) => w!(lang, SetCheckRefused, device = device),
+                        None => w!(lang, SetCheckRefusedUnnamed, address = address),
+                    };
+                    check_line(ui, Found::Bad, &title, Some(&w!(lang, SetCheckRefusedLine, speaker = &speaker)), |ui| {
                         if Button::standard(&w!(lang, SetAllowIt)).show(ui).clicked() {
-                            self.port.act(Act::Allow { address: address.clone(), speaker: speaker.clone() });
+                            let speaker = id.as_ref().map(|id| id.as_str().to_owned()).unwrap_or_default();
+                            self.port.act(Act::Allow { address: address.clone(), speaker });
                         }
                     });
                 }
@@ -311,7 +330,7 @@ impl ViewContent for CantHearView {
         // not at a step the app is still working on, nor after a remark.
         let connecting = matches!(snap.panel.place.state.sign, Sign::Spinner | Sign::SpinnerWarn);
         let broken = matches!(c.playing, Some(Err(_)))
-            || matches!(c.windows, Some(Err(WindowsSends::AppElsewhere { .. } | WindowsSends::InputLost | WindowsSends::Elsewhere { .. })))
+            || matches!(c.windows, Some(Err(WindowsSends::AppElsewhere { .. } | WindowsSends::InputLost)))
             || (matches!(c.connected, Some(Err(()))) && !connecting)
             || matches!(c.taking, Some(Err(Taking::NotAsking { .. } | Taking::Refused { .. } | Taking::Paused)))
             || matches!(c.volume, Some(Err(_)));

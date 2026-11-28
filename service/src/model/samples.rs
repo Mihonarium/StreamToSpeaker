@@ -90,6 +90,7 @@ pub fn scene() -> Scene {
         steps: DelaySteps::default(),
         search: SearchFacts::default(),
         network: None,
+        networks: Vec::new(),
         repair: RepairNow::NotAsked,
     }
 }

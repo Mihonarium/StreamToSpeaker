@@ -552,6 +552,8 @@ fn drop_during_play(offline: bool) {
             id: HOME_NET.into(),
             name: None,
             kind: crate::platform::ConnKind::WiFi,
+            adapter: None,
+            private: None,
         }]);
     }
     r.advance(16_000);
@@ -941,6 +943,48 @@ fn calls_follow_the_setting_and_return_to_their_own_device() {
     r.settle();
     assert_eq!(r.windows.default_for(Role::Communications), Some(monitor));
     assert_eq!(r.default(), output(SPEAKERS));
+}
+
+#[test]
+fn the_playback_check_names_a_device_privacy_refused_while_nobody_fetches_the_sound() {
+    use crate::model::{view::view, PortCore};
+    use crate::settings::{real::AppSettings, port::{Act, SettingsPort, Taking}};
+    let fake = FakeRenderer::start(answer);
+    let mut r = Rig::new(&fake, UserConfig::in_memory());
+    r.playing();
+    r.app.set_privacy_mode(true);
+    let settings = AppSettings::new(r.app.clone());
+    let port = Arc::new(PortCore::new(view(r.driver.scene(), None, false, 1)));
+    r.app.engine_port.set(Arc::downgrade(&port)).unwrap();
+    let not_asking = Some(Err(Taking::NotAsking { two_ways: false }));
+    // The speaker accepted the connection and nothing fetches the sound.
+    assert_eq!(settings.playback_check().taking, not_asking);
+    // Another device asks and privacy turns it away: it may be the one
+    // that plays the speaker's sound, so the step names it.
+    let other: std::net::IpAddr = "192.0.2.77".parse().unwrap();
+    assert!(r.app.check_stream_client(other).is_err());
+    assert_eq!(settings.playback_check().taking, Some(Err(Taking::Refused { device: None, address: "192.0.2.77".into() })));
+    // Allowed, it is no finding any more.
+    settings.act(Act::Allow { address: "192.0.2.77".into(), speaker: DEN.into() });
+    assert_eq!(settings.playback_check().taking, not_asking);
+    // With any device let to listen, an earlier refusal explains nothing.
+    let another: std::net::IpAddr = "192.0.2.78".parse().unwrap();
+    assert!(r.app.check_stream_client(another).is_err());
+    assert!(matches!(settings.playback_check().taking, Some(Err(Taking::Refused { .. }))));
+    r.app.set_privacy_mode(false);
+    assert_eq!(settings.playback_check().taking, not_asking);
+    r.app.set_privacy_mode(true);
+    assert!(matches!(settings.playback_check().taking, Some(Err(Taking::Refused { .. }))));
+    // A refusal belongs to the connection it happened in: once the
+    // speaker is picked anew, it isn't given as the reason for the new
+    // connection's silence.
+    r.send(Command::StayOnThisPc);
+    r.settle();
+    r.pick();
+    r.settle();
+    r.driver.look();
+    port.publish(view(r.driver.scene(), None, false, 2));
+    assert_eq!(settings.playback_check().taking, not_asking);
 }
 
 #[test]

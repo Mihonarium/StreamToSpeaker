@@ -6,7 +6,7 @@
 //! Work that touches the network (connecting, probing an address) runs on
 //! a thread of its own; nothing here waits for a speaker.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,11 @@ use std::time::Duration;
 
 use crate::app::{App, UpdateOutcome};
 use crate::delay::Kind;
+use crate::discovery_net::{NetAdapter, Resolved};
 use crate::equalizer::EQ_PRESETS;
 use crate::manual_speakers::{self, ManualKind};
+use crate::model::facts::NetworkSeen;
+use crate::model::situation::ConnKind;
 use crate::model::text::{Lang, LocalTime};
 use crate::sendspin_app::{is_sendspin_id, PairPromptKind, MA_OUTPUT_ID};
 
@@ -169,6 +172,24 @@ impl AppSettings {
 
     fn seen(&self, unix: u64) -> Seen {
         seen_at(unix, now_unix(), self.desktop.utc_offset_secs())
+    }
+
+    /// This PC's network connections as Windows describes them.
+    fn networks(&self) -> Vec<NetworkSeen> {
+        self.app.engine_view().map(|view| view.scene.networks.clone()).unwrap_or_default()
+    }
+
+    /// A device that asked for the sound during the present connection to
+    /// `speaker` and that privacy still refuses.
+    fn refused_now(&self, speaker: &crate::model::SpeakerId) -> Option<crate::app::RefusedDevice> {
+        let app = &self.app;
+        if !app.is_privacy_mode() {
+            return None;
+        }
+        let session = app.session_number();
+        app.recently_refused().into_iter().find(|r| {
+            r.session == session && r.speaker.as_deref().is_some_and(|id| crate::engine::place_driver::speaker_for_pick(app, id) == *speaker)
+        })
     }
 
     /// Every speaker the app lists, hidden ones included, as rows.
@@ -400,17 +421,21 @@ impl SettingsPort for AppSettings {
         let networks = app.discovery.is_some().then(|| {
             let st = app.discovery_net_status();
             let adapters = app.network_adapters();
+            let networks = self.networks();
             let looking = match &st.scope {
-                crate::discovery_net::Resolved::All => Looking::On(
+                Resolved::All => Looking::On(
                     adapters
                         .iter()
-                        .filter_map(|a| a.usable_ipv4().map(|ip| NetworkPlace { adapter: a.name.clone(), network: None, address: ip.to_string() }))
+                        .filter_map(|a| {
+                            a.usable_ipv4().map(|ip| NetworkPlace { adapter: a.name.clone(), network: network_name(&networks, a), address: ip.to_string() })
+                        })
                         .collect(),
                 ),
-                crate::discovery_net::Resolved::Active { name, ip } => {
-                    Looking::On(vec![NetworkPlace { adapter: name.clone(), network: None, address: ip.to_string() }])
+                Resolved::Active { name, ip } => {
+                    let network = adapters.iter().find(|a| a.ipv4.contains(ip)).and_then(|a| network_name(&networks, a));
+                    Looking::On(vec![NetworkPlace { adapter: name.clone(), network, address: ip.to_string() }])
                 }
-                crate::discovery_net::Resolved::Paused { name } => Looking::AdapterOff { adapter: name.clone() },
+                Resolved::Paused { name } => Looking::AdapterOff { adapter: name.clone() },
             };
             Networks {
                 adapters: adapters.iter().map(|a| Adapter { key: a.key.clone(), name: a.name.clone() }).collect(),
@@ -704,6 +729,11 @@ impl SettingsPort for AppSettings {
             Some(Kind::Upnp) => {
                 if app.subscriber_count() > 0 {
                     Ok(Taking::Yes)
+                } else if let Some(refused) = self.refused_now(id) {
+                    // Nothing fetches the sound, and privacy turned a
+                    // device away: it may be the one that plays it.
+                    let address = refused.address.to_string();
+                    Err(Taking::Refused { device: (refused.name != address).then_some(refused.name), address })
                 } else {
                     // The speaker can be reached by AirPlay as well.
                     Err(Taking::NotAsking { two_ways: scene.speaker(id).is_some_and(|row| row.airplay_way().is_some()) })
@@ -726,36 +756,9 @@ impl SettingsPort for AppSettings {
 
     fn discovery_check(&self) -> DiscoveryCheck {
         let app = &self.app;
-        let mut lines = Vec::new();
         let st = app.discovery_net_status();
-        let adapters = app.network_adapters();
         let found = app.speaker_view().speakers.iter().filter(|s| s.id != MA_OUTPUT_ID).count();
-        match &st.scope {
-            crate::discovery_net::Resolved::Paused { name } => lines.push(FindLine::AdapterOff { adapter: name.clone() }),
-            crate::discovery_net::Resolved::Active { name, ip } => {
-                lines.push(FindLine::LookingOn { place: NetworkPlace { adapter: name.clone(), network: None, address: subnet(&ip.to_string()) }, found })
-            }
-            crate::discovery_net::Resolved::All => {
-                let usable: Vec<_> = adapters.iter().filter_map(|a| a.usable_ipv4().map(|ip| (a, ip))).collect();
-                let vpn = |n: &str| {
-                    let n = n.to_lowercase();
-                    ["vpn", "tap-", "wireguard", "tailscale", "zerotier", "openvpn", "anyconnect"].iter().any(|w| n.contains(w))
-                };
-                let home: Vec<_> = usable.iter().filter(|(a, _)| !vpn(&a.name)).collect();
-                for (i, (a, ip)) in home.iter().enumerate() {
-                    lines.push(FindLine::LookingOn {
-                        place: NetworkPlace { adapter: a.name.clone(), network: None, address: subnet(&ip.to_string()) },
-                        found: if i == 0 { found } else { 0 },
-                    });
-                }
-                if let (Some((v, vip)), Some((h, _))) = (usable.iter().find(|(a, _)| vpn(&a.name)), home.first()) {
-                    lines.push(FindLine::Vpn {
-                        vpn: NetworkPlace { adapter: v.name.clone(), network: None, address: subnet(&vip.to_string()) },
-                        only: Adapter { key: h.key.clone(), name: h.name.clone() },
-                    });
-                }
-            }
-        }
+        let mut lines = find_lines(&st.scope, &app.network_adapters(), &self.networks(), found);
         if st.error.is_some() {
             lines.push(FindLine::AirPlaySearchFailed);
         }
@@ -1081,9 +1084,6 @@ impl SettingsPort for AppSettings {
             // Controls the real app's views leave out.
             Act::Language(_)
             | Act::OpenMusicAssistant
-            | Act::SendToUs
-            | Act::OpenNetworkSettings
-            | Act::AllowThroughFirewall
             | Act::Install
             | Act::CancelInstall
             | Act::CancelPassword(_) => log::debug!("settings: {described} isn't offered by this version"),
@@ -1150,6 +1150,63 @@ impl AppSettings {
             }),
         }
     }
+}
+
+/// What Windows says of the network an adapter is on. Windows writes the
+/// adapter's id with or without braces, in either case.
+fn network_on<'a>(networks: &'a [NetworkSeen], adapter: &NetAdapter) -> Option<&'a NetworkSeen> {
+    let plain = |id: &str| id.trim_matches(|c| c == '{' || c == '}').to_ascii_lowercase();
+    let key = plain(&adapter.key);
+    networks.iter().find(|n| n.adapter.as_deref().is_some_and(|id| plain(id) == key))
+}
+
+/// The name of the network an adapter is on, for the lines that say where
+/// the app looks. A VPN goes by its adapter's name alone, and so does a
+/// network Windows named after its adapter.
+fn network_name(networks: &[NetworkSeen], adapter: &NetAdapter) -> Option<String> {
+    let network = network_on(networks, adapter).filter(|n| n.kind != ConnKind::Other)?;
+    network.name.clone().filter(|name| !name.eq_ignore_ascii_case(&adapter.name))
+}
+
+/// The lines of *Check step by step* about where the app looks: each
+/// network, a VPN beside them, and what Windows treats each network as.
+pub(super) fn find_lines(scope: &Resolved, adapters: &[NetAdapter], networks: &[NetworkSeen], found: usize) -> Vec<FindLine> {
+    let mut lines = Vec::new();
+    let place = |a: &NetAdapter, ip: Ipv4Addr| NetworkPlace { adapter: a.name.clone(), network: network_name(networks, a), address: subnet(&ip.to_string()) };
+    // What Windows treats an adapter's network as, where it says. A VPN's
+    // isn't a finding about the network the speakers are on.
+    let profile = |a: &NetAdapter| {
+        let network = network_on(networks, a).filter(|n| n.kind != ConnKind::Other)?;
+        Some(FindLine::Profile { network: network.name.clone().unwrap_or_else(|| a.name.clone()), private: network.private? })
+    };
+    match scope {
+        Resolved::Paused { name } => lines.push(FindLine::AdapterOff { adapter: name.clone() }),
+        Resolved::Active { name, ip } => {
+            let adapter = adapters.iter().find(|a| a.ipv4.contains(ip));
+            let network = adapter.and_then(|a| network_name(networks, a));
+            lines.push(FindLine::LookingOn { place: NetworkPlace { adapter: name.clone(), network, address: subnet(&ip.to_string()) }, found });
+            lines.extend(adapter.and_then(profile));
+        }
+        Resolved::All => {
+            let usable: Vec<_> = adapters.iter().filter_map(|a| a.usable_ipv4().map(|ip| (a, ip))).collect();
+            let vpn = |n: &str| {
+                let n = n.to_lowercase();
+                ["vpn", "tap-", "wireguard", "tailscale", "zerotier", "openvpn", "anyconnect"].iter().any(|w| n.contains(w))
+            };
+            let home: Vec<_> = usable.iter().filter(|(a, _)| !vpn(&a.name)).collect();
+            for (i, (a, ip)) in home.iter().enumerate() {
+                lines.push(FindLine::LookingOn { place: place(a, *ip), found: if i == 0 { found } else { 0 } });
+            }
+            if let (Some((v, vip)), Some((h, _))) = (usable.iter().find(|(a, _)| vpn(&a.name)), home.first()) {
+                lines.push(FindLine::Vpn {
+                    vpn: NetworkPlace { adapter: v.name.clone(), network: None, address: subnet(&vip.to_string()) },
+                    only: Adapter { key: h.key.clone(), name: h.name.clone() },
+                });
+            }
+            lines.extend(home.iter().filter_map(|(a, _)| profile(a)));
+        }
+    }
+    lines
 }
 
 /// `192.168.1.23` → `192.168.1.x`: the network, not this PC.
